@@ -2,6 +2,28 @@
 
 1111
 
+## 性能检测数据可视化
+
+项目新增脚本 `camera_check_fastapi/tools/visualize_performance_metrics.py`，用于将
+`/metrics/performance` 接口返回的 JSON 生成可交互的 HTML 仪表盘。脚本仅依赖
+Python 标准库，默认会从本地运行的 FastAPI 服务拉取数据并在当前目录生成
+`performance_metrics.html`。
+
+```bash
+cd camera_check_fastapi/tools
+python visualize_performance_metrics.py \
+    http://localhost:8000/metrics/performance \
+    --output performance.html
+python -m webbrowser performance.html
+```
+
+如果已经导出了离线 JSON，可以将文件路径或 `-` (代表标准输入) 作为数据来源。
+
+```bash
+python visualize_performance_metrics.py snapshot.json --title "离线性能报告"
+```
+
+
 ## Getting started
 
 To make it easy for you to get started with GitLab, here's a list of recommended next steps.
