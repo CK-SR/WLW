@@ -1,6 +1,6 @@
 from pathlib import Path
 import os, yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 
 from pydantic_settings import BaseSettings
@@ -44,6 +44,11 @@ class LoggingSettings(BaseSettings):
 class KafkaSettings(BaseSettings):
     bootstrap_servers: str = "192.168.130.111:9092"
 
+class I18NSettings(BaseModel):
+    default_language: str = "en"
+    fallback_language: str = "en"
+    supported_languages: list[str] = Field(default_factory=lambda: ["en"])
+
 class Settings(BaseModel):
     env: str
     redis: RedisConfig
@@ -51,7 +56,8 @@ class Settings(BaseModel):
     server: ServerConfig
     server: ServerSettings = ServerSettings()
     logging: LoggingSettings = LoggingSettings()
-    kafka: KafkaSettings =  KafkaSettings()
+    kafka: KafkaSettings = KafkaSettings()
+    i18n: I18NSettings = I18NSettings()
 
 def load_settings() -> Settings:
     env = os.getenv("APP_ENV", "local")

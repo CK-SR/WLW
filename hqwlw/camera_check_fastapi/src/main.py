@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 import asyncio
 import concurrent.futures
-from typing import Dict, Set, Optional
+from enum import Enum
+from typing import Any, Dict, Set, Optional
 import redis
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import JSONResponse
@@ -15,6 +16,11 @@ import re
 
 import camera_check_fastapi.src.settings as settings # 导入自定义配置
 from configs.settings import settings as config_settings
+from camera_check_fastapi.src.i18n import (
+    DEFAULT_TRANSLATIONS,
+    I18NConfig,
+    LanguageManager,
+)
 
 # === MinIO ===
 import io
@@ -41,6 +47,13 @@ r = redis.Redis(
     decode_responses=config_settings.redis.decode_responses,
 )
 
+i18n_config = I18NConfig(
+    default_language=config_settings.i18n.default_language,
+    fallback_language=config_settings.i18n.fallback_language,
+    supported_languages=tuple(config_settings.i18n.supported_languages or ["en"]),
+)
+LANGUAGE_MANAGER = LanguageManager(DEFAULT_TRANSLATIONS, config=i18n_config)
+
 # 默认参数
 CURRENT_THRESHOLD = settings.DEFAULT_CURRENT_THRESHOLD
 EDGE_PARAMS = settings.DEFAULT_EDGE_PARAMS.copy()
@@ -50,7 +63,45 @@ TAMPER_PARAMS = {
     "high_ratio": 0.15,            # 高差异像素比例阈值
 }
 
-EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+class StreamState(str, Enum):
+    NORMAL = "Normal"
+    BLACK_SCREEN = "Black Screen"
+    OCCLUDED = "Occluded"
+    TAMPERED = "Tampered (Violent Motion)"
+    ERROR = "Error"
+
+
+STATE_KEY_MAP: Dict[StreamState, str] = {
+    StreamState.NORMAL: "state.normal",
+    StreamState.BLACK_SCREEN: "state.black_screen",
+    StreamState.OCCLUDED: "state.occluded",
+    StreamState.TAMPERED: "state.tampered",
+    StreamState.ERROR: "state.error",
+}
+
+
+def localized_message_payload(key: str, field_name: str = "msg", **fmt: Any) -> Dict[str, Any]:
+    message = LANGUAGE_MANAGER.message(key, **fmt)
+    return {field_name: message["msg"], f"{field_name}_i18n": message["i18n"]}
+
+
+def build_state_payload(
+    state: StreamState,
+    decode_ms: Optional[float],
+    **extra: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"state": state.value}
+    if decode_ms is not None:
+        payload["decode_ms"] = round(float(decode_ms), 3)
+    payload.update(extra)
+    payload["state_i18n"] = LANGUAGE_MANAGER.bundle(STATE_KEY_MAP[state])
+    return payload
+
+
+def make_error_response(key: str, status_code: int = 400, **fmt: Any) -> JSONResponse:
+    body = {"ok": False, **localized_message_payload(key, field_name="error", **fmt)}
+    return JSONResponse(body, status_code=status_code)
 
 SUBSCRIBED_STREAMS: Set[str] = set()
 SUBSCRIBE_EPOCH: int = 0
@@ -239,22 +290,33 @@ def _decode_and_analyze_frame(
         nparr = np.frombuffer(jpeg_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         t1 = time.monotonic()
-        decode_ms = round((t1 - t0) * 1000, 3)
+        decode_ms = (t1 - t0) * 1000
 
         if frame is None:
-            return ({"state": "Error", "error": "Decoding failed", "decode_ms": decode_ms}, prev_frame)
+            result = build_state_payload(
+                StreamState.ERROR,
+                decode_ms,
+                **localized_message_payload("error.decoding_failed", field_name="error"),
+            )
+            return result, prev_frame
 
         grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         # 1. 黑屏
         if float(grey.mean()) < float(current_threshold):
-            return ({"state": "Black Screen", "decode_ms": decode_ms}, grey)
+            result = build_state_payload(StreamState.BLACK_SCREEN, decode_ms)
+            return result, grey
 
         # 2. 遮挡
         edges = cv2.Canny(grey, int(edge_params["low"]), int(edge_params["high"]))
         edge_ratio = float(cv2.countNonZero(edges)) / float(grey.size)
         if edge_ratio < float(edge_params["min_ratio"]):
-            return ({"state": "Occluded", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms}, grey)
+            result = build_state_payload(
+                StreamState.OCCLUDED,
+                decode_ms,
+                edge_ratio=round(edge_ratio * 100.0, 2),
+            )
+            return result, grey
 
         # 3. 恶意破坏
         if prev_frame is not None:
@@ -274,20 +336,27 @@ def _decode_and_analyze_frame(
 
             if (diff_mean > float(tamper_params["diff_threshold"]) and
                 (high_diff_ratio > float(tamper_params["high_ratio"]) or roi_ratio > 0.5)):
-                return ({
-                    "state": "Tampered (Violent Motion)",
-                    "diff_mean": round(diff_mean, 2),
-                    "high_diff_ratio": round(high_diff_ratio, 2),
-                    "roi_ratio": round(roi_ratio, 2),
-                    "decode_ms": decode_ms
-                }, grey)
+                result = build_state_payload(
+                    StreamState.TAMPERED,
+                    decode_ms,
+                    diff_mean=round(diff_mean, 2),
+                    high_diff_ratio=round(high_diff_ratio, 2),
+                    roi_ratio=round(roi_ratio, 2),
+                )
+                return result, grey
 
         # 4. 正常
-        return ({"state": "Normal", "edge_ratio": round(edge_ratio * 100.0, 2), "decode_ms": decode_ms}, grey)
+        result = build_state_payload(
+            StreamState.NORMAL,
+            decode_ms,
+            edge_ratio=round(edge_ratio * 100.0, 2),
+        )
+        return result, grey
 
     except Exception as e:
         print(f"[analyze][error] {e}")
-        return ({"state": "Error", "error": str(e), "decode_ms": 0.0}, prev_frame)
+        result = build_state_payload(StreamState.ERROR, 0.0, error=str(e))
+        return result, prev_frame
 
 
 # ★★★ 替换 analyze_frame_async 返回类型 ★★★
@@ -481,10 +550,10 @@ async def start_service():
     global SERVICE_ACTIVE
     if SERVICE_ACTIVE:
         print("[service] start called, but already active")
-        return {"ok": True, "msg": "Service already started"}
+        return {"ok": True, **localized_message_payload("service.already_started")}
     SERVICE_ACTIVE = True
     print("[service] started")
-    return {"ok": True, "msg": "Service started"}
+    return {"ok": True, **localized_message_payload("service.started")}
 
 
 @router.post("/stop")
@@ -492,7 +561,7 @@ async def stop_service():
     global SERVICE_ACTIVE, STREAM_WORKERS, SUBSCRIBED_STREAMS, PREV_FRAMES
     if not SERVICE_ACTIVE:
         print("[service] stop called, but already inactive")
-        return {"ok": True, "msg": "Service already stopped"}
+        return {"ok": True, **localized_message_payload("service.already_stopped")}
 
     SERVICE_ACTIVE = False
     print("[service] stopping workers...")
@@ -503,7 +572,7 @@ async def stop_service():
     SUBSCRIBED_STREAMS.clear()
     PREV_FRAMES.clear()
     print("[service] stopped, resources released")
-    return {"ok": True, "msg": "Service stopped and resources released"}
+    return {"ok": True, **localized_message_payload("service.stopped")}
 
 
 @router.post("/subscribe")
@@ -512,11 +581,11 @@ async def subscribe(body: Dict = Body(...)):
 
     if not SERVICE_ACTIVE:
         print("[subscribe] rejected, service not started")
-        return JSONResponse({"ok": False, "error": "Service not started"}, status_code=400)
+        return make_error_response("error.service_not_started", status_code=400)
 
     streams = body.get("streams", [])
     if not isinstance(streams, list):
-        return JSONResponse({"ok": False, "error": "streams must be a list"}, status_code=400)
+        return make_error_response("error.streams_not_list", status_code=400)
 
     CURRENT_THRESHOLD = int(body.get("current_threshold", settings.DEFAULT_CURRENT_THRESHOLD))
     EDGE_PARAMS.update({k: v for k, v in body.get("edge_params", {}).items() if k in EDGE_PARAMS})
