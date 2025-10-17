@@ -1,7 +1,7 @@
 from pathlib import Path
 import os, yaml
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 
 from pydantic_settings import BaseSettings
 
@@ -49,6 +49,30 @@ class I18NSettings(BaseModel):
     fallback_language: str = "en"
     supported_languages: list[str] = Field(default_factory=lambda: ["en"])
 
+class MinioSettings(BaseModel):
+    endpoint: str = "192.168.130.162:9100"
+    access_key: str = "minioadmin"
+    secret_key: str = "minioadmin123"
+    bucket: str = "camera-checkout"
+    secure: bool = False
+    max_frames_per_stream: int = 1000
+    trim_interval: int = 1000
+    use_intrussion_suffix: bool = True
+    save_mode: Literal["all", "abnormal", "sample", "none"] = "all"
+    sample_fps: float = 1.0
+    jpeg_quality: int = 85
+
+
+class StreamSettings(BaseModel):
+    ws_send_mode: Literal["all", "abnormal"] = "all"
+
+
+class MonitoringSettings(BaseModel):
+    enabled: bool = True
+    history_size: int = 120
+    frame_history: int = 60
+
+
 class Settings(BaseModel):
     env: str
     redis: RedisConfig
@@ -58,6 +82,44 @@ class Settings(BaseModel):
     logging: LoggingSettings = LoggingSettings()
     kafka: KafkaSettings = KafkaSettings()
     i18n: I18NSettings = I18NSettings()
+    minio: MinioSettings = MinioSettings()
+    stream: StreamSettings = StreamSettings()
+    monitoring: MonitoringSettings = MonitoringSettings()
+
+
+def _apply_env_overrides(settings: Settings) -> Settings:
+    """Allow legacy environment variables to override YAML configuration."""
+
+    env_map = {
+        "minio.endpoint": ("MINIO_ENDPOINT", str),
+        "minio.access_key": ("MINIO_ACCESS_KEY", str),
+        "minio.secret_key": ("MINIO_SECRET_KEY", str),
+        "minio.bucket": ("MINIO_BUCKET", str),
+        "minio.secure": ("MINIO_SECURE", lambda v: str(v).lower() in {"1", "true", "yes"}),
+        "minio.max_frames_per_stream": ("MINIO_MAX_FRAMES_PER_STREAM", int),
+        "minio.trim_interval": ("MINIO_TRIM_INTERVAL", int),
+        "minio.use_intrussion_suffix": ("MINIO_USE_INTRUSSION_SUFFIX", lambda v: str(v).lower() in {"1", "true", "yes"}),
+        "minio.save_mode": ("MINIO_SAVE_MODE", str),
+        "minio.sample_fps": ("MINIO_SAMPLE_FPS", float),
+        "minio.jpeg_quality": ("MINIO_JPEG_QUALITY", int),
+        "stream.ws_send_mode": ("WS_SEND_MODE", str),
+    }
+
+    for dotted_key, (env_var, caster) in env_map.items():
+        raw = os.getenv(env_var)
+        if raw is None:
+            continue
+        section, attr = dotted_key.split(".", 1)
+        target = getattr(settings, section, None)
+        if target is None:
+            continue
+        try:
+            value = caster(raw)
+        except Exception:
+            continue
+        setattr(target, attr, value)
+
+    return settings
 
 def load_settings() -> Settings:
     env = os.getenv("APP_ENV", "local")
@@ -66,7 +128,8 @@ def load_settings() -> Settings:
         raise FileNotFoundError(f"Config file not found: {config_path}")
     with open(config_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    return Settings(**data)
+    settings = Settings(**data)
+    return _apply_env_overrides(settings)
 
 settings = load_settings()
 

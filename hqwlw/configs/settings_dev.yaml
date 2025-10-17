@@ -29,3 +29,24 @@ i18n:
     - en
     - zh-CN
 
+minio:
+  endpoint: 192.168.130.162:9100
+  access_key: minioadmin
+  secret_key: minioadmin123
+  bucket: camera-checkout
+  secure: false
+  max_frames_per_stream: 1000
+  trim_interval: 1000
+  use_intrussion_suffix: true
+  save_mode: all
+  sample_fps: 1.0
+  jpeg_quality: 85
+
+stream:
+  ws_send_mode: all
+
+monitoring:
+  enabled: true
+  history_size: 240
+  frame_history: 120
+
