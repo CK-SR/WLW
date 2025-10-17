@@ -21,6 +21,7 @@ from camera_check_fastapi.src.i18n import (
     I18NConfig,
     LanguageManager,
 )
+from camera_check_fastapi.src.performance import PERFORMANCE_MONITOR
 
 # === MinIO ===
 import io
@@ -53,6 +54,15 @@ i18n_config = I18NConfig(
     supported_languages=tuple(config_settings.i18n.supported_languages or ["en"]),
 )
 LANGUAGE_MANAGER = LanguageManager(DEFAULT_TRANSLATIONS, config=i18n_config)
+
+MONITORING_ENABLED = bool(config_settings.monitoring.enabled)
+if MONITORING_ENABLED:
+    PERFORMANCE_MONITOR.configure(
+        history_size=int(config_settings.monitoring.history_size),
+        frame_history=int(config_settings.monitoring.frame_history),
+    )
+else:
+    PERFORMANCE_MONITOR.reset()
 
 # 默认参数
 CURRENT_THRESHOLD = settings.DEFAULT_CURRENT_THRESHOLD
@@ -125,28 +135,29 @@ if TEST_MODE:
     os.makedirs(TEST_VIDEO_DIR, exist_ok=True)
 
 
-# ===== MinIO 配置（环境变量可覆盖）=====
-MINIO_ENDPOINT   = os.getenv("MINIO_ENDPOINT", "192.168.130.162:9100")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
-MINIO_BUCKET     = os.getenv("MINIO_BUCKET", "camera-checkout")
-MINIO_SECURE     = os.getenv("MINIO_SECURE", "0") == "1"
-WS_SEND_MODE = os.getenv("WS_SEND_MODE", "all")  # all / abnormal
-MINIO_MAX_FRAMES_PER_STREAM = int(os.getenv("MINIO_MAX_FRAMES_PER_STREAM", "1000"))
+# ===== MinIO 配置（配置文件 + 环境变量可覆盖）=====
+MINIO_ENDPOINT = config_settings.minio.endpoint
+MINIO_ACCESS_KEY = config_settings.minio.access_key
+MINIO_SECRET_KEY = config_settings.minio.secret_key
+MINIO_BUCKET = config_settings.minio.bucket
+MINIO_SECURE = bool(config_settings.minio.secure)
+MINIO_MAX_FRAMES_PER_STREAM = int(config_settings.minio.max_frames_per_stream)
 
 # 触发清理的上传间隔（每路累计 N 次上传再触发一次清理，降低 list_objects 频率）
-MINIO_TRIM_INTERVAL = int(os.getenv("MINIO_TRIM_INTERVAL", "1000"))
+MINIO_TRIM_INTERVAL = int(config_settings.minio.trim_interval)
 
 # 是否在文件名加 intrussion 后缀；仅命名习惯，无功能差异
-MINIO_USE_INTRUSSION_SUFFIX = os.getenv("MINIO_USE_INTRUSSION_SUFFIX", "1") == "1"
+MINIO_USE_INTRUSSION_SUFFIX = bool(config_settings.minio.use_intrussion_suffix)
 
 # 每路上传计数器，用于间隔触发清理
 TRIM_COUNTER: Dict[str, int] = {}
 
 # 保存策略：all / abnormal / sample / none
-MINIO_SAVE_MODE  = os.getenv("MINIO_SAVE_MODE", "all")
-MINIO_SAMPLE_FPS = float(os.getenv("MINIO_SAMPLE_FPS", "1"))  # sample 模式下的目标 FPS
-MINIO_JPEG_Q     = int(os.getenv("MINIO_JPEG_QUALITY", "85"))
+MINIO_SAVE_MODE = config_settings.minio.save_mode
+MINIO_SAMPLE_FPS = float(config_settings.minio.sample_fps)  # sample 模式下的目标 FPS
+MINIO_JPEG_Q = int(config_settings.minio.jpeg_quality)
+
+WS_SEND_MODE = config_settings.stream.ws_send_mode  # all / abnormal
 
 MINIO_CLIENT: Minio | None = None
 LAST_MINIO_SAVE_TS: Dict[str, float] = {}  # 每路上次保存时间（sample 用）
@@ -380,6 +391,7 @@ def _read_one_from_redis(stream_name: str, block_ms: int = 1000):
 async def get_one_frame(stream_name: str, timeout_sec: float = 1.0):
     loop = asyncio.get_running_loop()
     deadline = time.time() + timeout_sec
+    start_monotonic = time.monotonic()
     while time.time() < deadline:
         streams = await loop.run_in_executor(
             EXECUTOR_IO, _read_one_from_redis, stream_name, int(timeout_sec * 1000)
@@ -390,6 +402,9 @@ async def get_one_frame(stream_name: str, timeout_sec: float = 1.0):
                 for _id, fields in messages:
                     meta = json.loads(fields[b"meta"].decode("utf-8"))
                     jpeg = fields[b"jpeg"]
+                    if MONITORING_ENABLED:
+                        elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
+                        PERFORMANCE_MONITOR.record_stage(stream_name, "redis_fetch", elapsed_ms)
                     return meta, jpeg
         else:
             print(f"[redis] no frame for {stream_name}, retry...")
@@ -432,6 +447,23 @@ async def stream_worker(stream_name: str):
             ts4_iso  = now_iso_utc()
             e2e_ms   = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
 
+            if MONITORING_ENABLED:
+                PERFORMANCE_MONITOR.record_frame(
+                    stream_name,
+                    {
+                        "capture": cap_ms,
+                        "queue": queue_ms,
+                        "decode": decode_ms,
+                        "analysis": analysis_ms,
+                        "processing": proc_ms,
+                        "end_to_end": e2e_ms,
+                    },
+                    state=analysis.get("state"),
+                    ts_wall=meta.get("ts_wall_iso"),
+                    ts3=ts3_iso,
+                    ts4=ts4_iso,
+                )
+
             # ========== 异常判定 ==========
             is_abnormal = analysis.get("state") not in ("Normal", None)
 
@@ -444,7 +476,11 @@ async def stream_worker(stream_name: str):
             save_this = (MINIO_SAVE_MODE == "all") or (MINIO_SAVE_MODE == "abnormal" and is_abnormal)
             _minio_pending_ref = None
             if save_this and MINIO_CLIENT:
+                t_upload_start = time.monotonic()
                 etag = await minio_put_bytes(obj_key, raw_jpeg, content_type="image/jpeg")
+                if MONITORING_ENABLED:
+                    upload_ms = (time.monotonic() - t_upload_start) * 1000.0
+                    PERFORMANCE_MONITOR.record_stage(stream_name, "minio_upload", upload_ms)
                 if etag:
                     _minio_pending_ref = {
                         "type": "frame",
@@ -458,7 +494,11 @@ async def stream_worker(stream_name: str):
                     cnt = TRIM_COUNTER.get(safe_id, 0) + 1
                     TRIM_COUNTER[safe_id] = cnt
                     if cnt % MINIO_TRIM_INTERVAL == 0:
+                        t_trim_start = time.monotonic()
                         deleted = await minio_trim_prefix(prefix=f"{safe_id}/", keep_last_n=MINIO_MAX_FRAMES_PER_STREAM)
+                        if MONITORING_ENABLED:
+                            trim_ms = (time.monotonic() - t_trim_start) * 1000.0
+                            PERFORMANCE_MONITOR.record_stage(stream_name, "minio_trim", trim_ms)
                         print(f"[minio][trim] trigger prefix={safe_id}/ deleted={deleted} keep={MINIO_MAX_FRAMES_PER_STREAM}")
 
             # ========== 组织 WS payload（仍包含分析结果）==========
@@ -501,6 +541,31 @@ async def stream_worker(stream_name: str):
         if video_writer is not None and video_writer.isOpened():
             video_writer.release()
             print(f"[worker] saved video for {stream_name}, total frames={frame_count}")
+
+
+@router.get("/metrics/performance", summary="获取性能统计")
+async def get_performance_metrics():
+    if not MONITORING_ENABLED:
+        return {"enabled": False}
+    snapshot = PERFORMANCE_MONITOR.snapshot()
+    snapshot["enabled"] = True
+    return snapshot
+
+
+@router.get("/metrics/performance/{stream_name}", summary="获取某路视频流的性能统计")
+async def get_stream_performance_metrics(stream_name: str):
+    if not MONITORING_ENABLED:
+        return {"enabled": False, "stream": stream_name, "stages": {}, "frames": []}
+    snapshot = PERFORMANCE_MONITOR.snapshot(stream=stream_name)
+    snapshot["enabled"] = True
+    return snapshot
+
+
+@router.delete("/metrics/performance", summary="重置性能统计")
+async def reset_performance_metrics():
+    if MONITORING_ENABLED:
+        PERFORMANCE_MONITOR.reset()
+    return {"enabled": MONITORING_ENABLED}
 
 
 async def broadcaster():
