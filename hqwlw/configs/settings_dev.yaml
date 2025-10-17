@@ -21,3 +21,11 @@ server:
 logging:
   dir: /workspace/logs  # 容器内日志目录（会被 docker-compose 挂载出来）
   level: info        # 日志级别，可选 debug / info / warning / error
+
+i18n:
+  default_language: zh-CN
+  fallback_language: en
+  supported_languages:
+    - en
+    - zh-CN
+

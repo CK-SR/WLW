@@ -24,3 +24,10 @@ logging:
 
 kafka:
   bootstrap_servers: "192.168.130.111:9092"
+
+i18n:
+  default_language: zh-CN
+  fallback_language: en
+  supported_languages:
+    - en
+    - zh-CN
