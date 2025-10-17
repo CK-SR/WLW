@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+  hqwlw-all:
+    image: hqwlw_lzy:latest
+    container_name: hqwlw-all-lzy
+    working_dir: /workspace
+    entrypoint:
+      - gunicorn
+      - -k
+      - uvicorn.workers.UvicornWorker
+      - -c
+      - gunicorn.conf.py
+      - multi_interface:app
+    ports:
+      - "5020:5011"
+    environment:
+      APP_ENV: "dev"
+      ENABLED_ROUTERS: camera 
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all              # 可选，保险
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      REDIS_HOST: 192.168.130.14
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      GROUP: fire_g
+      CONSUMER: fire_c_${HOSTNAME}
+      BATCH_SIZE: "3"
+    restart: unless-stopped
+    volumes:
+      - type: bind
+        source: /home/cs/hqwlw_zsh/models
+        target: /workspace/models
+        read_only: true
+      - type: bind
+        source: /home/cs/hqwlw_zsh/data/embeddings
+        target: /workspace/face_fastapi/embeddings
+        read_only: false
+      - type: bind
+        source: /home/cs/hqwlw_zsh/data/faceImages
+        target: /workspace/face_fastapi/faceImages
+        read_only: false
+
+      - /home/cs/hqwlw_zsh/data/logs:/workspace/logs
+      - /home/cs/hqwlw_zsh/models:/root/.insightface/models:ro
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
+    logging:
+      driver: "json-file"        # 或 "local"
+      options:
+        max-size: "10m"          # 单个日志文件最大 10MB
+        max-file: "5"            # 保留 5 个轮转文件

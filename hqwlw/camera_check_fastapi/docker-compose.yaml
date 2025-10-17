@@ -1,0 +1,33 @@
+services:
+  pushhub:
+    build: .
+    container_name: pushhub
+    working_dir: /workspace/camera_fastapi
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0
+      --port 5020
+      --log-level info
+    ports:
+      - "5020:5020"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      
+      ENABLE_TEST_VIDEO: "0"             
+      TEST_VIDEO_FPS: "10"               
+      TEST_VIDEO_DIR: "/workspace/out"   
+    volumes:
+      - type: bind
+        source: /home/cs/hqwlw_lzy/camera_fastapi
+        target: /workspace/camera_fastapi
+      - type: bind
+        source: /home/cs/hqwlw_lzy/test_out
+        target: /workspace/out   
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]

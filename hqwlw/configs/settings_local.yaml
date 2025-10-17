@@ -1,0 +1,26 @@
+# configs/settings_local.yaml
+env: local
+
+redis:
+  host: 192.168.130.14
+  port: 6379
+  db: 0
+
+models:
+  insightface_root: /home/cs/hqwlw_zsh/
+  insightface_name: buffalo_l
+  yolo_path: /home/cs/hqwlw_zsh/models
+
+server:
+  host: 0.0.0.0
+  port: 5011
+  workers: 1         # gunicorn workers 数量，默认 1
+  threads: 5         # 每个 worker 的线程数，默认 5
+  timeout: 0         # 请求超时时间，0 表示不超时，适合长连接/流式接口
+
+logging:
+  dir: /home/cs/hqwlw_zsh/data/logs  # 容器内日志目录（会被 docker-compose 挂载出来）
+  level: info        # 日志级别，可选 debug / info / warning / error
+
+kafka:
+  bootstrap_servers: "192.168.130.111:9092"
