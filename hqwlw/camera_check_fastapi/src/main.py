@@ -6,7 +6,6 @@ import asyncio
 import concurrent.futures
 from enum import Enum
 from typing import Any, Dict, Set, Optional
-import logging
 import redis
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import JSONResponse
@@ -55,8 +54,6 @@ i18n_config = I18NConfig(
     supported_languages=tuple(config_settings.i18n.supported_languages or ["en"]),
 )
 LANGUAGE_MANAGER = LanguageManager(DEFAULT_TRANSLATIONS, config=i18n_config)
-
-logger = logging.getLogger(__name__)
 
 MONITORING_ENABLED = bool(config_settings.monitoring.enabled)
 if MONITORING_ENABLED:
@@ -185,15 +182,14 @@ from datetime import timezone, datetime
 def now_iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def parse_iso_to_epoch(iso_or_none, label: str = "timestamp") -> float | None:
-    """把 '2025-10-10T02:13:19.584Z' 转为 epoch 秒(float)。异常返回 None 并记录日志。"""
+def parse_iso_to_epoch(iso_or_none) -> float | None:
+    """把 '2025-10-10T02:13:19.584Z' 转为 epoch 秒(float)。异常返回 None。"""
     if not iso_or_none:
         return None
     try:
         s = str(iso_or_none).replace("Z", "+00:00")
         return datetime.fromisoformat(s).timestamp()
     except Exception:
-        logger.warning("invalid ISO timestamp for %s: %r", label, iso_or_none, exc_info=True)
         return None
 
 
@@ -206,87 +202,6 @@ def _to_builtin(o):
     if isinstance(o, (np.ndarray,)):
         return o.tolist()
     return o
-
-
-def _safe_float(value: Any, *, label: str, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        logger.warning("invalid float value for %s: %r; using default %s", label, value, default)
-        return default
-
-
-def compute_latency_metrics(
-    stream_name: str,
-    meta: Dict[str, Any],
-    ts3_epoch: float,
-    t_proc_start: float,
-    t_proc_end: float,
-    analysis: Dict[str, Any],
-) -> Dict[str, Any]:
-    """计算延迟并验证时间戳有效性。发生异常时记录日志并返回兜底值。"""
-    timestamp_issues: list[str] = []
-
-    ts1_raw = meta.get("ts1")
-    ts2_raw = meta.get("ts2")
-    ts1_epoch = parse_iso_to_epoch(ts1_raw, label="ts1")
-    ts2_epoch = parse_iso_to_epoch(ts2_raw, label="ts2")
-
-    ts4_epoch = time.time()
-    ts4_iso = now_iso_utc()
-
-    decode_ms = _safe_float(analysis.get("decode_ms", 0.0), label="analysis.decode_ms", default=0.0)
-    proc_ms = max((t_proc_end - t_proc_start) * 1000.0, 0.0)
-    analysis_ms = max(proc_ms - decode_ms, 0.0)
-
-    cap_ms = None
-    queue_ms = None
-    e2e_ms = None
-
-    if ts1_raw and ts1_epoch is None:
-        timestamp_issues.append(f"ts1 invalid format: {ts1_raw}")
-    if ts2_raw and ts2_epoch is None:
-        timestamp_issues.append(f"ts2 invalid format: {ts2_raw}")
-
-    if ts1_epoch is not None and ts2_epoch is not None:
-        if ts2_epoch >= ts1_epoch:
-            cap_ms = (ts2_epoch - ts1_epoch) * 1000.0
-        else:
-            timestamp_issues.append(
-                f"ts2 earlier than ts1 (ts2={ts2_epoch}, ts1={ts1_epoch})"
-            )
-
-    if ts2_epoch is not None:
-        if ts3_epoch >= ts2_epoch:
-            queue_ms = (ts3_epoch - ts2_epoch) * 1000.0
-        else:
-            timestamp_issues.append(
-                f"ts3 earlier than ts2 (ts3={ts3_epoch}, ts2={ts2_epoch})"
-            )
-
-    if ts1_epoch is not None:
-        if ts4_epoch >= ts1_epoch:
-            e2e_ms = (ts4_epoch - ts1_epoch) * 1000.0
-        else:
-            timestamp_issues.append(
-                f"ts4 earlier than ts1 (ts4={ts4_epoch}, ts1={ts1_epoch})"
-            )
-
-    if timestamp_issues:
-        logger.warning(
-            "timestamp validation issues for stream %s: %s", stream_name, "; ".join(timestamp_issues)
-        )
-
-    return {
-        "cap_ms": cap_ms,
-        "queue_ms": queue_ms,
-        "decode_ms": decode_ms,
-        "analysis_ms": analysis_ms,
-        "proc_ms": proc_ms,
-        "e2e_ms": e2e_ms,
-        "ts4_iso": ts4_iso,
-        "timestamp_issues": timestamp_issues,
-    }
 
 
 def _minio_init():
@@ -522,35 +437,15 @@ async def stream_worker(stream_name: str):
                 PREV_FRAMES[stream_name] = curr_grey
 
             # ========== 计算时延 ==========
-            try:
-                latency = compute_latency_metrics(
-                    stream_name,
-                    meta,
-                    ts3_epoch,
-                    t_proc_start,
-                    t_proc_end,
-                    analysis,
-                )
-            except Exception:
-                logger.exception("failed to compute latency metrics for stream %s", stream_name)
-                latency = {
-                    "cap_ms": None,
-                    "queue_ms": None,
-                    "decode_ms": 0.0,
-                    "analysis_ms": 0.0,
-                    "proc_ms": 0.0,
-                    "e2e_ms": None,
-                    "ts4_iso": now_iso_utc(),
-                    "timestamp_issues": ["exception"],
-                }
-
-            cap_ms = latency["cap_ms"]
-            queue_ms = latency["queue_ms"]
-            decode_ms = latency["decode_ms"]
-            analysis_ms = latency["analysis_ms"]
-            proc_ms = latency["proc_ms"]
-            e2e_ms = latency["e2e_ms"]
-            ts4_iso = latency["ts4_iso"]
+            ts1_epoch = parse_iso_to_epoch(meta.get("ts1"))
+            ts2_epoch = parse_iso_to_epoch(meta.get("ts2"))
+            cap_ms   = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
+            queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
+            proc_ms  = (t_proc_end - t_proc_start) * 1000.0
+            decode_ms   = float(analysis.get("decode_ms", 0.0))
+            analysis_ms = max(proc_ms - decode_ms, 0.0)
+            ts4_iso  = now_iso_utc()
+            e2e_ms   = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
 
             if MONITORING_ENABLED:
                 PERFORMANCE_MONITOR.record_frame(
