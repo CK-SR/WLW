@@ -5,7 +5,8 @@ import numpy as np
 import asyncio
 import concurrent.futures
 from enum import Enum
-from typing import Any, Dict, Set, Optional
+from typing import Any, Callable, Dict, Set, Optional
+import functools
 import redis
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Body
 from fastapi.responses import JSONResponse
@@ -13,6 +14,7 @@ import uvicorn
 from datetime import datetime
 import os
 import re
+from uuid import uuid4
 
 import camera_check_fastapi.src.settings as settings # 导入自定义配置
 from configs.settings import settings as config_settings
@@ -26,6 +28,7 @@ from camera_check_fastapi.src.performance import PERFORMANCE_MONITOR
 # === MinIO ===
 import io
 from minio import Minio
+from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
 
 
@@ -146,11 +149,11 @@ MINIO_MAX_FRAMES_PER_STREAM = int(config_settings.minio.max_frames_per_stream)
 # 触发清理的上传间隔（每路累计 N 次上传再触发一次清理，降低 list_objects 频率）
 MINIO_TRIM_INTERVAL = int(config_settings.minio.trim_interval)
 
+MINIO_TRIM_BATCH = int(os.getenv("MINIO_TRIM_BATCH", "1000"))
+MINIO_TRIM_MAX_DELETE = int(os.getenv("MINIO_TRIM_MAX_DELETE", "5000"))
+
 # 是否在文件名加 intrussion 后缀；仅命名习惯，无功能差异
 MINIO_USE_INTRUSSION_SUFFIX = bool(config_settings.minio.use_intrussion_suffix)
-
-# 每路上传计数器，用于间隔触发清理
-TRIM_COUNTER: Dict[str, int] = {}
 
 # 保存策略：all / abnormal / sample / none
 MINIO_SAVE_MODE = config_settings.minio.save_mode
@@ -161,6 +164,70 @@ WS_SEND_MODE = config_settings.stream.ws_send_mode  # all / abnormal
 
 MINIO_CLIENT: Minio | None = None
 LAST_MINIO_SAVE_TS: Dict[str, float] = {}  # 每路上次保存时间（sample 用）
+
+MINIO_COUNTS_KEY = "minio:counts"
+MINIO_TRIM_LOCK_PREFIX = "minio:trim:lock:"
+MINIO_TRIM_LOCK_TTL = 60
+
+_RELEASE_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+
+async def run_in_io_executor(func: Callable, *args, **kwargs):
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(EXECUTOR_IO, bound)
+
+
+async def redis_hincrby_count(safe_id: str, delta: int) -> int:
+    try:
+        result = await run_in_io_executor(r.hincrby, MINIO_COUNTS_KEY, safe_id, delta)
+        return int(result)
+    except Exception as e:
+        print(f"[redis][error] hincrby {MINIO_COUNTS_KEY} {safe_id} {delta}: {e}")
+        return 0
+
+
+async def redis_hget_count(safe_id: str) -> int:
+    try:
+        value = await run_in_io_executor(r.hget, MINIO_COUNTS_KEY, safe_id)
+    except Exception as e:
+        print(f"[redis][error] hget {MINIO_COUNTS_KEY} {safe_id}: {e}")
+        return 0
+    if value is None:
+        return 0
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8")
+        except Exception:
+            pass
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def redis_acquire_lock(lock_key: str, token: str, ttl: int = MINIO_TRIM_LOCK_TTL) -> bool:
+    try:
+        result = await run_in_io_executor(r.set, lock_key, token, nx=True, ex=ttl)
+        return bool(result)
+    except Exception as e:
+        print(f"[redis][error] setnx {lock_key}: {e}")
+        return False
+
+
+async def redis_release_lock(lock_key: str, token: str) -> bool:
+    try:
+        result = await run_in_io_executor(r.eval, _RELEASE_LOCK_LUA, 1, lock_key, token)
+        return bool(result)
+    except Exception as e:
+        print(f"[redis][error] release lock {lock_key}: {e}")
+        return False
 
 # ★ 安全文件名生成器
 def safe_filename(stream_name: str) -> str:
@@ -245,48 +312,83 @@ async def minio_put_bytes(obj_key: str, data: bytes, content_type: str = "image/
     return await loop.run_in_executor(EXECUTOR_IO, _put)
 
 
-async def minio_trim_prefix(prefix: str, keep_last_n: int) -> int:
+async def minio_trim_prefix(prefix: str, keep_last_n: int, safe_id: str | None = None) -> int:
     """保留前缀下最近 keep_last_n 个对象，多余的按时间顺序删除；返回删除数量"""
-    if not MINIO_CLIENT or keep_last_n <= 0:
+    if not MINIO_CLIENT or keep_last_n < 0:
         return 0
 
-    loop = asyncio.get_running_loop()
+    safe_id = safe_id or prefix.rstrip("/").split("/")[0]
+    lock_key = f"{MINIO_TRIM_LOCK_PREFIX}{safe_id}"
+    token = uuid4().hex
+    acquired = await redis_acquire_lock(lock_key, token)
+    if not acquired:
+        return 0
 
-    def _trim():
-        try:
-            objs = list(MINIO_CLIENT.list_objects(MINIO_BUCKET, prefix=prefix, recursive=True))
-            total = len(objs)
-            if total <= keep_last_n:
-                # 快照日志
-                print(f"[minio][trim][snapshot] prefix={prefix} total={total} (<= keep)")
-                return 0
-            # 如果对象名里使用了 13 位零填充的毫秒时间戳（build_obj_key)，
-            # 可直接按 object_name 排序代表时间先后；否则按 last_modified。
-            try:
-                objs_sorted = sorted(objs, key=lambda o: o.object_name)
-            except Exception:
-                objs_sorted = sorted(objs, key=lambda o: o.last_modified)
+    start_monotonic = time.monotonic()
+    deleted = 0
 
-            to_del = objs_sorted[: total - keep_last_n]  # 删除更旧的
-            cnt = 0
-            for o in to_del:
-                try:
-                    MINIO_CLIENT.remove_object(MINIO_BUCKET, o.object_name)
-                    cnt += 1
-                except Exception as e:
-                    print(f"[minio][trim][warn] remove {o.object_name}: {e}")
-
-            # 再做一次快照
-            rest = total - cnt
-            newest = objs_sorted[-1].object_name if rest > 0 else "-"
-            oldest_after = objs_sorted[total - cnt].object_name if rest > 0 else "-"
-            print(f"[minio][trim][snapshot] prefix={prefix} deleted={cnt} rest={rest} oldest_after={oldest_after} newest={newest}")
-            return cnt
-        except Exception as e:
-            print(f"[minio][trim][error] {e}")
+    try:
+        curr_count = await redis_hget_count(safe_id)
+        to_delete = max(curr_count - keep_last_n, 0)
+        if to_delete <= 0:
+            print(f"[minio][trim][skip] prefix={prefix} curr={curr_count} keep={keep_last_n}")
             return 0
 
-    return await loop.run_in_executor(EXECUTOR_IO, _trim)
+        to_delete = min(to_delete, MINIO_TRIM_MAX_DELETE)
+        if to_delete <= 0:
+            return 0
+
+        def _trim_batch():
+            deleted_total = 0
+            visited = 0
+            batch: list[DeleteObject] = []
+            batch_limit = max(MINIO_TRIM_BATCH, 1)
+            try:
+                iterator = MINIO_CLIENT.list_objects(
+                    MINIO_BUCKET, prefix=prefix, recursive=True
+                )
+                for obj in iterator:
+                    if visited >= to_delete:
+                        break
+                    batch.append(DeleteObject(obj.object_name))
+                    visited += 1
+                    if len(batch) >= batch_limit or visited >= to_delete:
+                        errors = MINIO_CLIENT.remove_objects(MINIO_BUCKET, batch)
+                        failed = 0
+                        for err in errors:
+                            failed += 1
+                            print(
+                                f"[minio][trim][warn] remove {getattr(err, 'object_name', '?')}: {getattr(err, 'message', err)}"
+                            )
+                        deleted_total += len(batch) - failed
+                        batch = []
+                if batch and visited <= to_delete:
+                    errors = MINIO_CLIENT.remove_objects(MINIO_BUCKET, batch)
+                    failed = 0
+                    for err in errors:
+                        failed += 1
+                        print(
+                            f"[minio][trim][warn] remove {getattr(err, 'object_name', '?')}: {getattr(err, 'message', err)}"
+                        )
+                    deleted_total += len(batch) - failed
+                return deleted_total, visited
+            except Exception as e:
+                print(f"[minio][trim][error] prefix={prefix} {e}")
+                return deleted_total, visited
+
+        deleted, scanned = await run_in_io_executor(_trim_batch)
+        if deleted > 0:
+            await redis_hincrby_count(safe_id, -deleted)
+        rest_est = max(curr_count - deleted, 0)
+        print(
+            f"[minio][trim] prefix={prefix} target={to_delete} scanned={scanned} deleted={deleted} rest_est={rest_est} keep={keep_last_n}"
+        )
+        return deleted
+    finally:
+        if MONITORING_ENABLED:
+            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
+            PERFORMANCE_MONITOR.record_stage(safe_id, "minio_trim", elapsed_ms)
+        await redis_release_lock(lock_key, token)
 
 # ★★★ 替换原函数签名和所有 return ★★★
 def _decode_and_analyze_frame(
@@ -489,17 +591,21 @@ async def stream_worker(stream_name: str):
                         "etag": etag,
                         "reason": "abnormal" if is_abnormal else "all"
                     }
-                    # 分批触发清理
+                    # 分批触发清理（异步后台执行）
                     safe_id = safe_filename(stream_name)
-                    cnt = TRIM_COUNTER.get(safe_id, 0) + 1
-                    TRIM_COUNTER[safe_id] = cnt
-                    if cnt % MINIO_TRIM_INTERVAL == 0:
-                        t_trim_start = time.monotonic()
-                        deleted = await minio_trim_prefix(prefix=f"{safe_id}/", keep_last_n=MINIO_MAX_FRAMES_PER_STREAM)
-                        if MONITORING_ENABLED:
-                            trim_ms = (time.monotonic() - t_trim_start) * 1000.0
-                            PERFORMANCE_MONITOR.record_stage(stream_name, "minio_trim", trim_ms)
-                        print(f"[minio][trim] trigger prefix={safe_id}/ deleted={deleted} keep={MINIO_MAX_FRAMES_PER_STREAM}")
+                    new_count = await redis_hincrby_count(safe_id, 1)
+                    if MINIO_TRIM_INTERVAL > 0 and new_count > 0 and new_count % MINIO_TRIM_INTERVAL == 0:
+                        async def _trim_task():
+                            try:
+                                await minio_trim_prefix(
+                                    prefix=f"{safe_id}/",
+                                    keep_last_n=MINIO_MAX_FRAMES_PER_STREAM,
+                                    safe_id=safe_id,
+                                )
+                            except Exception as e:
+                                print(f"[minio][trim][error] task {safe_id}: {e}")
+
+                        asyncio.create_task(_trim_task())
 
             # ========== 组织 WS payload（仍包含分析结果）==========
             payload = {
