@@ -35,6 +35,7 @@ minio:
   secret_key: minioadmin123
   bucket: camera-checkout
   secure: false
+  ring_enabled: false
   max_frames_per_stream: 1000
   trim_interval: 400
   use_intrussion_suffix: true

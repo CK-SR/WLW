@@ -23,6 +23,12 @@ python -m webbrowser performance.html
 python visualize_performance_metrics.py snapshot.json --title "离线性能报告"
 ```
 
+## MinIO 存储策略
+
+- 通过配置项 `minio.ring_enabled` 可在环形覆盖缓存与批量删除两种策略之间切换。开启环形模式后，每路流仅复用 `max_frames_per_stream` 个键名槽位，新帧会覆盖最旧槽位。
+- 环形模式下异常帧仍会按照时间戳路径额外写一份以便长期保存；性能监控的 `minio_upload` 指标保持可用，而 `minio_trim` 指标不再上报。
+- **注意：**环形覆盖依赖对象覆盖语义，请确保目标 bucket 未启用 Versioning。
+
 
 ## Getting started
 
