@@ -5,7 +5,7 @@ import numpy as np
 import asyncio
 import concurrent.futures
 from enum import Enum
-from typing import Any, Callable, Dict, Set, Optional
+from typing import Any, Callable, Dict, List, Set, Optional
 import functools
 import redis
 from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect, Body
@@ -146,6 +146,7 @@ MINIO_ACCESS_KEY = config_settings.minio.access_key
 MINIO_SECRET_KEY = config_settings.minio.secret_key
 MINIO_BUCKET = config_settings.minio.bucket
 MINIO_SECURE = bool(config_settings.minio.secure)
+MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", False))
 MINIO_MAX_FRAMES_PER_STREAM = int(config_settings.minio.max_frames_per_stream)
 
 # 触发清理的上传间隔（每路累计 N 次上传再触发一次清理，降低 list_objects 频率）
@@ -170,6 +171,7 @@ LAST_MINIO_SAVE_TS: Dict[str, float] = {}  # 每路上次保存时间（sample �
 MINIO_COUNTS_KEY = "minio:counts"
 MINIO_TRIM_LOCK_PREFIX = "minio:trim:lock:"
 MINIO_TRIM_LOCK_TTL = 180
+MINIO_RING_INDEX_KEY = "minio:ring:index"
 
 _RELEASE_LOCK_LUA = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -215,6 +217,24 @@ async def redis_hget_count(safe_id: str) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
+        return 0
+
+
+async def redis_hset_count(safe_id: str, value: int) -> bool:
+    try:
+        await run_in_io_executor(r.hset, MINIO_COUNTS_KEY, safe_id, int(value))
+        return True
+    except Exception as e:
+        print(f"[redis][error] hset {MINIO_COUNTS_KEY} {safe_id} {value}: {e}")
+        return False
+
+
+async def redis_hincrby_ring_index(safe_id: str, delta: int) -> int:
+    try:
+        result = await run_in_io_executor(r.hincrby, MINIO_RING_INDEX_KEY, safe_id, delta)
+        return int(result)
+    except Exception as e:
+        print(f"[redis][error] hincrby {MINIO_RING_INDEX_KEY} {safe_id} {delta}: {e}")
         return 0
 
 
@@ -269,6 +289,11 @@ def build_obj_key(stream_name: str, ts_ms: int) -> str:
     stamp = f"{ts_ms:013d}"  # 始终 13 位，例如 001723... 保证字典序=时间序
     tail = "_intrussion" if MINIO_USE_INTRUSSION_SUFFIX else ""
     return f"{safe_id}/{stamp}{tail}.jpg"
+
+
+def build_ring_obj_key(safe_id: str, slot_index: int) -> str:
+    tail = "_intrussion" if MINIO_USE_INTRUSSION_SUFFIX else ""
+    return f"{safe_id}/ring/{slot_index:06d}{tail}.jpg"
 
 from datetime import timezone, datetime
 
@@ -337,8 +362,34 @@ async def minio_put_bytes(obj_key: str, data: bytes, content_type: str = "image/
     return await run_in_executor(MINIO_UPLOAD_EXECUTOR, _put)
 
 
+async def minio_ring_assign_slot(safe_id: str, ring_size: int) -> Optional[int]:
+    if ring_size <= 0:
+        return None
+    counter = await redis_hincrby_ring_index(safe_id, 1)
+    if counter <= 0:
+        return None
+    slot_index = (counter - 1) % ring_size
+    return slot_index
+
+
+async def minio_ring_record_success(safe_id: str, ring_size: int) -> None:
+    if ring_size <= 0:
+        await redis_hset_count(safe_id, 0)
+        return
+    current = await redis_hget_count(safe_id)
+    if current < 0:
+        await redis_hset_count(safe_id, 0)
+        current = 0
+    if current < ring_size:
+        await redis_hincrby_count(safe_id, 1)
+    elif current > ring_size:
+        await redis_hset_count(safe_id, ring_size)
+
+
 async def minio_trim_prefix(prefix: str, keep_last_n: int, safe_id: str | None = None) -> int:
     """保留前缀下最近 keep_last_n 个对象，多余的按时间顺序删除；返回删除数量"""
+    if MINIO_RING_ENABLED:
+        return 0
     if not MINIO_CLIENT or keep_last_n < 0:
         return 0
 
@@ -628,36 +679,97 @@ async def stream_worker(stream_name: str):
 
             # 保存策略：若你只想异常时写 -> 环境变量设 MINIO_SAVE_MODE=abnormal
             save_this = (MINIO_SAVE_MODE == "all") or (MINIO_SAVE_MODE == "abnormal" and is_abnormal)
-            _minio_pending_ref = None
+            _minio_pending_refs: List[dict] = []
+            upload_durations: List[float] = []
             if save_this and MINIO_CLIENT:
-                t_upload_start = time.monotonic()
-                etag = await minio_put_bytes(obj_key, raw_jpeg, content_type="image/jpeg")
-                if MONITORING_ENABLED:
-                    upload_ms = (time.monotonic() - t_upload_start) * 1000.0
-                    PERFORMANCE_MONITOR.record_stage(stream_name, "minio_upload", upload_ms)
-                if etag:
-                    _minio_pending_ref = {
-                        "type": "frame",
-                        "key": obj_key,
-                        "minio_object_key": obj_key,
-                        "etag": etag,
-                        "reason": "abnormal" if is_abnormal else "all"
-                    }
-                    # 分批触发清理（异步后台执行）
-                    safe_id = safe_filename(stream_name)
-                    new_count = await redis_hincrby_count(safe_id, 1)
-                    if MINIO_TRIM_INTERVAL > 0 and new_count > 0 and new_count % MINIO_TRIM_INTERVAL == 0:
-                        async def _trim_task():
-                            try:
-                                await minio_trim_prefix(
-                                    prefix=f"{safe_id}/",
-                                    keep_last_n=MINIO_MAX_FRAMES_PER_STREAM,
-                                    safe_id=safe_id,
-                                )
-                            except Exception as e:
-                                print(f"[minio][trim][error] task {safe_id}: {e}")
+                safe_id = safe_filename(stream_name)
+                primary_obj_key: Optional[str] = None
+                primary_reason = "abnormal" if is_abnormal else "all"
 
-                        asyncio.create_task(_trim_task())
+                if MINIO_RING_ENABLED and MINIO_MAX_FRAMES_PER_STREAM > 0:
+                    slot_index = await minio_ring_assign_slot(safe_id, MINIO_MAX_FRAMES_PER_STREAM)
+                    if slot_index is not None:
+                        ring_key = build_ring_obj_key(safe_id, slot_index)
+                        t_upload_start = time.monotonic()
+                        etag = await minio_put_bytes(ring_key, raw_jpeg, content_type="image/jpeg")
+                        if etag:
+                            upload_ms = (time.monotonic() - t_upload_start) * 1000.0
+                            upload_durations.append(upload_ms)
+                            _minio_pending_refs.append(
+                                {
+                                    "type": "frame",
+                                    "key": ring_key,
+                                    "minio_object_key": ring_key,
+                                    "etag": etag,
+                                    "reason": primary_reason,
+                                }
+                            )
+                            primary_obj_key = ring_key
+                            await minio_ring_record_success(safe_id, MINIO_MAX_FRAMES_PER_STREAM)
+
+                if primary_obj_key is None:
+                    t_upload_start = time.monotonic()
+                    etag = await minio_put_bytes(obj_key, raw_jpeg, content_type="image/jpeg")
+                    if etag:
+                        upload_ms = (time.monotonic() - t_upload_start) * 1000.0
+                        upload_durations.append(upload_ms)
+                        _minio_pending_refs.append(
+                            {
+                                "type": "frame",
+                                "key": obj_key,
+                                "minio_object_key": obj_key,
+                                "etag": etag,
+                                "reason": primary_reason,
+                            }
+                        )
+                        primary_obj_key = obj_key
+                        if MINIO_RING_ENABLED and MINIO_MAX_FRAMES_PER_STREAM > 0:
+                            await minio_ring_record_success(safe_id, MINIO_MAX_FRAMES_PER_STREAM)
+                        else:
+                            new_count = await redis_hincrby_count(safe_id, 1)
+                            if (
+                                MINIO_TRIM_INTERVAL > 0
+                                and new_count > 0
+                                and new_count % MINIO_TRIM_INTERVAL == 0
+                            ):
+
+                                async def _trim_task():
+                                    try:
+                                        await minio_trim_prefix(
+                                            prefix=f"{safe_id}/",
+                                            keep_last_n=MINIO_MAX_FRAMES_PER_STREAM,
+                                            safe_id=safe_id,
+                                        )
+                                    except Exception as e:
+                                        print(f"[minio][trim][error] task {safe_id}: {e}")
+
+                                asyncio.create_task(_trim_task())
+
+                if (
+                    MINIO_RING_ENABLED
+                    and is_abnormal
+                    and primary_obj_key is not None
+                    and primary_obj_key != obj_key
+                ):
+                    t_upload_start = time.monotonic()
+                    etag = await minio_put_bytes(obj_key, raw_jpeg, content_type="image/jpeg")
+                    if etag:
+                        upload_ms = (time.monotonic() - t_upload_start) * 1000.0
+                        upload_durations.append(upload_ms)
+                        _minio_pending_refs.append(
+                            {
+                                "type": "frame",
+                                "key": obj_key,
+                                "minio_object_key": obj_key,
+                                "etag": etag,
+                                "reason": "abnormal_archive",
+                            }
+                        )
+
+                if MONITORING_ENABLED and upload_durations:
+                    PERFORMANCE_MONITOR.record_stage(
+                        stream_name, "minio_upload", sum(upload_durations)
+                    )
 
             # ========== 组织 WS payload（仍包含分析结果）==========
             payload = {
@@ -680,8 +792,8 @@ async def stream_worker(stream_name: str):
                     }
                 }
             }
-            if _minio_pending_ref:
-                payload.setdefault("obj_refs", []).append(_minio_pending_ref)
+            if _minio_pending_refs:
+                payload.setdefault("obj_refs", []).extend(_minio_pending_refs)
 
             # WS 发送开关：all / abnormal
             if WS_SEND_MODE == "abnormal" and not is_abnormal:

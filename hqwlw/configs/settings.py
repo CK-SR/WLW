@@ -55,6 +55,7 @@ class MinioSettings(BaseModel):
     secret_key: str = "minioadmin123"
     bucket: str = "camera-checkout"
     secure: bool = False
+    ring_enabled: bool = False
     max_frames_per_stream: int = 1000
     trim_interval: int = 400
     use_intrussion_suffix: bool = True
@@ -96,6 +97,7 @@ def _apply_env_overrides(settings: Settings) -> Settings:
         "minio.secret_key": ("MINIO_SECRET_KEY", str),
         "minio.bucket": ("MINIO_BUCKET", str),
         "minio.secure": ("MINIO_SECURE", lambda v: str(v).lower() in {"1", "true", "yes"}),
+        "minio.ring_enabled": ("MINIO_RING_ENABLED", lambda v: str(v).lower() in {"1", "true", "yes"}),
         "minio.max_frames_per_stream": ("MINIO_MAX_FRAMES_PER_STREAM", int),
         "minio.trim_interval": ("MINIO_TRIM_INTERVAL", int),
         "minio.use_intrussion_suffix": ("MINIO_USE_INTRUSSION_SUFFIX", lambda v: str(v).lower() in {"1", "true", "yes"}),
