@@ -37,6 +37,8 @@ EXECUTOR_CPU = concurrent.futures.ThreadPoolExecutor(
 )
 
 EXECUTOR_IO = concurrent.futures.ThreadPoolExecutor(max_workers=64)
+MINIO_UPLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+MINIO_TRIM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 app = FastAPI(title="PushHub", version="1.0")
 
@@ -150,7 +152,7 @@ MINIO_MAX_FRAMES_PER_STREAM = int(config_settings.minio.max_frames_per_stream)
 MINIO_TRIM_INTERVAL = int(config_settings.minio.trim_interval)
 
 MINIO_TRIM_BATCH = int(os.getenv("MINIO_TRIM_BATCH", "1000"))
-MINIO_TRIM_MAX_DELETE = int(os.getenv("MINIO_TRIM_MAX_DELETE", "5000"))
+MINIO_TRIM_MAX_DELETE = int(os.getenv("MINIO_TRIM_MAX_DELETE", "2000"))
 
 # 是否在文件名加 intrussion 后缀；仅命名习惯，无功能差异
 MINIO_USE_INTRUSSION_SUFFIX = bool(config_settings.minio.use_intrussion_suffix)
@@ -167,7 +169,7 @@ LAST_MINIO_SAVE_TS: Dict[str, float] = {}  # 每路上次保存时间（sample �
 
 MINIO_COUNTS_KEY = "minio:counts"
 MINIO_TRIM_LOCK_PREFIX = "minio:trim:lock:"
-MINIO_TRIM_LOCK_TTL = 60
+MINIO_TRIM_LOCK_TTL = 180
 
 _RELEASE_LOCK_LUA = """
 if redis.call('get', KEYS[1]) == ARGV[1] then
@@ -178,10 +180,14 @@ end
 """
 
 
-async def run_in_io_executor(func: Callable, *args, **kwargs):
+async def run_in_executor(executor: concurrent.futures.Executor, func: Callable, *args, **kwargs):
     loop = asyncio.get_running_loop()
     bound = functools.partial(func, *args, **kwargs)
-    return await loop.run_in_executor(EXECUTOR_IO, bound)
+    return await loop.run_in_executor(executor, bound)
+
+
+async def run_in_io_executor(func: Callable, *args, **kwargs):
+    return await run_in_executor(EXECUTOR_IO, func, *args, **kwargs)
 
 
 async def redis_hincrby_count(safe_id: str, delta: int) -> int:
@@ -227,6 +233,26 @@ async def redis_release_lock(lock_key: str, token: str) -> bool:
         return bool(result)
     except Exception as e:
         print(f"[redis][error] release lock {lock_key}: {e}")
+        return False
+
+
+_EXTEND_LOCK_LUA = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('expire', KEYS[1], tonumber(ARGV[2]))
+else
+    return 0
+end
+"""
+
+
+async def redis_extend_lock(lock_key: str, token: str, ttl: int) -> bool:
+    try:
+        result = await run_in_io_executor(
+            r.eval, _EXTEND_LOCK_LUA, 1, lock_key, token, int(ttl)
+        )
+        return bool(result)
+    except Exception as e:
+        print(f"[redis][error] extend lock {lock_key}: {e}")
         return False
 
 # ★ 安全文件名生成器
@@ -292,7 +318,6 @@ async def minio_put_bytes(obj_key: str, data: bytes, content_type: str = "image/
     """把 bytes 异步上传到 MinIO，返回 etag；失败返回 None。放到 IO 线程池执行，避免阻塞事件循环。"""
     if not MINIO_CLIENT:
         return None
-    loop = asyncio.get_running_loop()
     bio = io.BytesIO(data)
     size = len(data)
 
@@ -309,7 +334,7 @@ async def minio_put_bytes(obj_key: str, data: bytes, content_type: str = "image/
             print(f"[minio][error] put {obj_key}: {e}")
             return None
 
-    return await loop.run_in_executor(EXECUTOR_IO, _put)
+    return await run_in_executor(MINIO_UPLOAD_EXECUTOR, _put)
 
 
 async def minio_trim_prefix(prefix: str, keep_last_n: int, safe_id: str | None = None) -> int:
@@ -324,8 +349,28 @@ async def minio_trim_prefix(prefix: str, keep_last_n: int, safe_id: str | None =
     if not acquired:
         return 0
 
-    start_monotonic = time.monotonic()
     deleted = 0
+    renew_stop = asyncio.Event()
+    renew_task: asyncio.Task | None = None
+
+    if MINIO_TRIM_LOCK_TTL > 0:
+        interval = max(MINIO_TRIM_LOCK_TTL / 3.0, 1.0)
+
+        async def _renew_lock():
+            try:
+                while True:
+                    try:
+                        await asyncio.wait_for(renew_stop.wait(), timeout=interval)
+                        break
+                    except asyncio.TimeoutError:
+                        ok = await redis_extend_lock(lock_key, token, MINIO_TRIM_LOCK_TTL)
+                        if not ok:
+                            print(f"[redis][warn] extend lock failed {lock_key}")
+                            break
+            except asyncio.CancelledError:
+                raise
+
+        renew_task = asyncio.create_task(_renew_lock())
 
     try:
         curr_count = await redis_hget_count(safe_id)
@@ -376,18 +421,25 @@ async def minio_trim_prefix(prefix: str, keep_last_n: int, safe_id: str | None =
                 print(f"[minio][trim][error] prefix={prefix} {e}")
                 return deleted_total, visited
 
-        deleted, scanned = await run_in_io_executor(_trim_batch)
+        start_monotonic = time.monotonic()
+        deleted, scanned = await run_in_executor(MINIO_TRIM_EXECUTOR, _trim_batch)
+        elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
         if deleted > 0:
             await redis_hincrby_count(safe_id, -deleted)
         rest_est = max(curr_count - deleted, 0)
         print(
             f"[minio][trim] prefix={prefix} target={to_delete} scanned={scanned} deleted={deleted} rest_est={rest_est} keep={keep_last_n}"
         )
+        if MONITORING_ENABLED:
+            PERFORMANCE_MONITOR.record_stage(safe_id, "minio_trim", elapsed_ms)
         return deleted
     finally:
-        if MONITORING_ENABLED:
-            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
-            PERFORMANCE_MONITOR.record_stage(safe_id, "minio_trim", elapsed_ms)
+        renew_stop.set()
+        if renew_task:
+            try:
+                await renew_task
+            except Exception as e:
+                print(f"[redis][warn] lock renew task error {lock_key}: {e}")
         await redis_release_lock(lock_key, token)
 
 # ★★★ 替换原函数签名和所有 return ★★★

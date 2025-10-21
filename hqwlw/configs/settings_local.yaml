@@ -39,7 +39,7 @@ minio:
   bucket: camera-checkout
   secure: false
   max_frames_per_stream: 1000
-  trim_interval: 1000
+  trim_interval: 400
   use_intrussion_suffix: true
   save_mode: all
   sample_fps: 1.0

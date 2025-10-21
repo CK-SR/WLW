@@ -56,7 +56,7 @@ class MinioSettings(BaseModel):
     bucket: str = "camera-checkout"
     secure: bool = False
     max_frames_per_stream: int = 1000
-    trim_interval: int = 1000
+    trim_interval: int = 400
     use_intrussion_suffix: bool = True
     save_mode: Literal["all", "abnormal", "sample", "none"] = "all"
     sample_fps: float = 1.0
