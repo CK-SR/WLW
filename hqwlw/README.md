@@ -26,8 +26,46 @@ python visualize_performance_metrics.py snapshot.json --title "离线性能报�
 ## MinIO 存储策略
 
 - 通过配置项 `minio.ring_enabled` 可在环形覆盖缓存与批量删除两种策略之间切换。开启环形模式后，每路流仅复用 `max_frames_per_stream` 个键名槽位，新帧会覆盖最旧槽位。
-- 环形模式下异常帧仍会按照时间戳路径额外写一份以便长期保存；性能监控的 `minio_upload` 指标保持可用，而 `minio_trim` 指标不再上报。
-- **注意：**环形覆盖依赖对象覆盖语义，请确保目标 bucket 未启用 Versioning。
+- 环形模式下帧文件仅保留在环形槽位内，不再额外按时间戳写入异常帧副本，从而降低存储占用；性能监控的 `minio_trim` 指标仍仅在关闭环形模式时上报。
+- 项目提供 `MinioManager` 类（位于 `camera_check_fastapi/src/main.py`）统一封装上传、环形缓存与清理操作，其他模块可直接复用。
+
+### MinioManager 使用示例
+
+```python
+from camera_check_fastapi.src.main import MinioManager
+from redis import Redis
+from concurrent.futures import ThreadPoolExecutor
+
+redis_client = Redis(host="127.0.0.1", port=6379, decode_responses=True)
+
+manager = MinioManager(
+    redis_client,
+    endpoint="127.0.0.1:9000",
+    access_key="minioadmin",
+    secret_key="minioadmin",
+    bucket="frames",
+    secure=False,
+    counts_key="minio:counts",
+    ring_index_key="minio:ring:index",
+    trim_lock_prefix="minio:trim:lock:",
+    trim_lock_ttl=180,
+    trim_batch=1000,
+    trim_max_delete=2000,
+    io_executor=ThreadPoolExecutor(max_workers=32),
+    upload_executor=ThreadPoolExecutor(max_workers=16),
+    trim_executor=ThreadPoolExecutor(max_workers=8),
+    ring_enabled=True,
+)
+
+manager.initialize()
+
+if manager.is_ready:
+    etag = await manager.put_bytes("camera001/latest.jpg", jpeg_bytes)
+    slot = await manager.assign_ring_slot("camera001", ring_size=120)
+    await manager.record_ring_success("camera001", ring_size=120)
+    await manager.trim_prefix("camera001/", keep_last_n=120, safe_id="camera001")
+```
+
 
 
 ## Getting started
