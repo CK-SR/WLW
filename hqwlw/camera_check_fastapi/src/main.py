@@ -14,7 +14,6 @@ import uvicorn
 from datetime import datetime
 import os
 import re
-from uuid import uuid4
 
 import camera_check_fastapi.src.settings as settings # 导入自定义配置
 from configs.settings import settings as config_settings
@@ -28,8 +27,12 @@ from camera_check_fastapi.src.performance import PERFORMANCE_MONITOR
 # === MinIO ===
 import io
 from minio import Minio
-from minio.deleteobjects import DeleteObject
 from minio.error import S3Error
+
+try:
+    from minio.lifecycleconfig import Expiration, Filter, LifecycleConfig, Rule
+except ImportError:  # pragma: no cover - 兼容旧版 SDK
+    Expiration = Filter = LifecycleConfig = Rule = None  # type: ignore
 
 
 EXECUTOR_CPU = concurrent.futures.ThreadPoolExecutor(
@@ -38,7 +41,6 @@ EXECUTOR_CPU = concurrent.futures.ThreadPoolExecutor(
 
 EXECUTOR_IO = concurrent.futures.ThreadPoolExecutor(max_workers=64)
 MINIO_UPLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32)
-MINIO_TRIM_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=16)
 
 app = FastAPI(title="PushHub", version="1.0")
 
@@ -146,39 +148,34 @@ MINIO_ACCESS_KEY = config_settings.minio.access_key
 MINIO_SECRET_KEY = config_settings.minio.secret_key
 MINIO_BUCKET = config_settings.minio.bucket
 MINIO_SECURE = bool(config_settings.minio.secure)
-MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", False))
 MINIO_MAX_FRAMES_PER_STREAM = int(config_settings.minio.max_frames_per_stream)
-
-# 触发清理的上传间隔（每路累计 N 次上传再触发一次清理，降低 list_objects 频率）
-MINIO_TRIM_INTERVAL = int(config_settings.minio.trim_interval)
-
-MINIO_TRIM_BATCH = int(os.getenv("MINIO_TRIM_BATCH", "1000"))
-MINIO_TRIM_MAX_DELETE = int(os.getenv("MINIO_TRIM_MAX_DELETE", "2000"))
 
 # 是否在文件名加 intrussion 后缀；仅命名习惯，无功能差异
 MINIO_USE_INTRUSSION_SUFFIX = bool(config_settings.minio.use_intrussion_suffix)
 
-# 保存策略：all / abnormal / sample / none
+# 保存策略：all / abnormal / none
 MINIO_SAVE_MODE = config_settings.minio.save_mode
-MINIO_SAMPLE_FPS = float(config_settings.minio.sample_fps)  # sample 模式下的目标 FPS
-MINIO_JPEG_Q = int(config_settings.minio.jpeg_quality)
 
 WS_SEND_MODE = config_settings.stream.ws_send_mode  # all / abnormal
 
-LAST_MINIO_SAVE_TS: Dict[str, float] = {}  # 每路上次保存时间（sample 用）
+def _resolve_minio_lifecycle_days() -> int:
+    if hasattr(config_settings.minio, "lifecycle_days"):
+        value = getattr(config_settings.minio, "lifecycle_days")
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    env_value = os.getenv("MINIO_LIFECYCLE_DAYS")
+    if env_value not in (None, ""):
+        try:
+            return int(env_value)
+        except ValueError:
+            pass
+    return 3
 
-MINIO_COUNTS_KEY = "minio:counts"
-MINIO_TRIM_LOCK_PREFIX = "minio:trim:lock:"
-MINIO_TRIM_LOCK_TTL = 180
-MINIO_RING_INDEX_KEY = "minio:ring:index"
 
-_RELEASE_LOCK_LUA = """
-if redis.call('get', KEYS[1]) == ARGV[1] then
-    return redis.call('del', KEYS[1])
-else
-    return 0
-end
-"""
+MINIO_LIFECYCLE_DAYS = _resolve_minio_lifecycle_days()
 
 
 async def run_in_executor(executor: concurrent.futures.Executor, func: Callable, *args, **kwargs):
@@ -194,44 +191,29 @@ async def run_in_io_executor(func: Callable, *args, **kwargs):
 class MinioManager:
     def __init__(
         self,
-        redis_client: redis.Redis,
         *,
         endpoint: str,
         access_key: str,
         secret_key: str,
         bucket: str,
         secure: bool,
-        counts_key: str,
-        ring_index_key: str,
-        trim_lock_prefix: str,
-        trim_lock_ttl: int,
-        trim_batch: int,
-        trim_max_delete: int,
+        lifecycle_days: int,
         io_executor: concurrent.futures.Executor,
         upload_executor: concurrent.futures.Executor,
-        trim_executor: concurrent.futures.Executor,
-        ring_enabled: bool = False,
         monitor_callback: Callable[[str, str, float], None] | None = None,
     ) -> None:
-        self._redis = redis_client
         self.endpoint = endpoint
         self.access_key = access_key
         self.secret_key = secret_key
         self.bucket = bucket
         self.secure = secure
-        self.counts_key = counts_key
-        self.ring_index_key = ring_index_key
-        self.trim_lock_prefix = trim_lock_prefix
-        self.trim_lock_ttl = trim_lock_ttl
-        self.trim_batch = trim_batch
-        self.trim_max_delete = trim_max_delete
+        self.lifecycle_days = lifecycle_days
         self._io_executor = io_executor
         self._upload_executor = upload_executor
-        self._trim_executor = trim_executor
-        self._ring_enabled = ring_enabled
         self._monitor_callback = monitor_callback
         self._client: Minio | None = None
-        self._release_lock_script = redis_client.register_script(_RELEASE_LOCK_LUA)
+        self._ring_ptr: Dict[str, int] = {}
+        self._ring_lock = asyncio.Lock()
 
     @property
     def is_ready(self) -> bool:
@@ -249,9 +231,38 @@ class MinioManager:
                 client.make_bucket(self.bucket)
             self._client = client
             print(f"[minio] ready -> {self.endpoint} bucket={self.bucket}")
+            self._apply_lifecycle_policy()
         except Exception as e:
             self._client = None
             print(f"[minio][error] init failed: {e}")
+
+    def _apply_lifecycle_policy(self) -> None:
+        if not self._client or self.lifecycle_days <= 0:
+            return
+        try:
+            if LifecycleConfig and Rule and Expiration and Filter:
+                rule = Rule(
+                    "expire-all",
+                    status="Enabled",
+                    expiration=Expiration(days=int(self.lifecycle_days)),
+                    filter=Filter(prefix=""),
+                )
+                config = LifecycleConfig(rules=[rule])
+                self._client.set_bucket_lifecycle(self.bucket, config)
+            else:
+                days = int(self.lifecycle_days)
+                xml = (
+                    "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+                    "<Rule><ID>expire-all</ID><Status>Enabled</Status>"
+                    f"<Filter><Prefix></Prefix></Filter><Expiration><Days>{days}</Days></Expiration>"
+                    "</Rule></LifecycleConfiguration>"
+                )
+                self._client.set_bucket_lifecycle(self.bucket, xml)
+            print(
+                f"[minio] lifecycle configured: expire after {self.lifecycle_days} days"
+            )
+        except Exception as e:
+            print(f"[minio][warn] set lifecycle failed: {e}")
 
     async def put_bytes(
         self, obj_key: str, data: bytes, content_type: str = "image/jpeg"
@@ -277,228 +288,14 @@ class MinioManager:
 
         return await self._run_in_executor(self._upload_executor, _put)
 
-    async def assign_ring_slot(self, safe_id: str, ring_size: int) -> Optional[int]:
+    async def next_ring_slot(self, safe_id: str, ring_size: int) -> Optional[int]:
         if ring_size <= 0:
             return None
-        counter = await self._redis_hincrby(self.ring_index_key, safe_id, 1)
-        if counter <= 0:
-            return None
-        return (counter - 1) % ring_size
-
-    async def record_ring_success(self, safe_id: str, ring_size: int) -> None:
-        if ring_size <= 0:
-            await self.set_frame_count(safe_id, 0)
-            return
-        current = await self.get_frame_count(safe_id)
-        if current < 0:
-            await self.set_frame_count(safe_id, 0)
-            current = 0
-        if current < ring_size:
-            await self.increment_frame_count(safe_id, 1)
-        elif current > ring_size:
-            await self.set_frame_count(safe_id, ring_size)
-
-    async def trim_prefix(
-        self, prefix: str, keep_last_n: int, safe_id: str | None = None
-    ) -> int:
-        if self._ring_enabled:
-            return 0
-        if not self._client or keep_last_n < 0:
-            return 0
-
-        safe_id = safe_id or prefix.rstrip("/").split("/")[0]
-        lock_key = f"{self.trim_lock_prefix}{safe_id}"
-        token = uuid4().hex
-        acquired = await self._acquire_lock(lock_key, token)
-        if not acquired:
-            return 0
-
-        deleted = 0
-        renew_stop = asyncio.Event()
-        renew_task: asyncio.Task | None = None
-
-        if self.trim_lock_ttl > 0:
-            interval = max(self.trim_lock_ttl / 3.0, 1.0)
-
-            async def _renew_lock():
-                try:
-                    while True:
-                        try:
-                            await asyncio.wait_for(renew_stop.wait(), timeout=interval)
-                            break
-                        except asyncio.TimeoutError:
-                            ok = await self._extend_lock(lock_key, token, self.trim_lock_ttl)
-                            if not ok:
-                                print(f"[redis][warn] extend lock failed {lock_key}")
-                                break
-                except asyncio.CancelledError:
-                    raise
-
-            renew_task = asyncio.create_task(_renew_lock())
-
-        try:
-            curr_count = await self.get_frame_count(safe_id)
-            to_delete = max(curr_count - keep_last_n, 0)
-            if to_delete <= 0:
-                print(
-                    f"[minio][trim][skip] prefix={prefix} curr={curr_count} keep={keep_last_n}"
-                )
-                return 0
-
-            to_delete = min(to_delete, self.trim_max_delete)
-            if to_delete <= 0:
-                return 0
-
-            def _trim_batch():
-                deleted_total = 0
-                visited = 0
-                batch: list[DeleteObject] = []
-                batch_limit = max(self.trim_batch, 1)
-                try:
-                    iterator = self._client.list_objects(
-                        self.bucket, prefix=prefix, recursive=True
-                    )
-                    for obj in iterator:
-                        if visited >= to_delete:
-                            break
-                        batch.append(DeleteObject(obj.object_name))
-                        visited += 1
-                        if len(batch) >= batch_limit or visited >= to_delete:
-                            errors = self._client.remove_objects(self.bucket, batch)
-                            failed = 0
-                            for err in errors:
-                                failed += 1
-                                print(
-                                    f"[minio][trim][warn] remove {getattr(err, 'object_name', '?')}: {getattr(err, 'message', err)}"
-                                )
-                            deleted_total += len(batch) - failed
-                            batch = []
-                    if batch and visited <= to_delete:
-                        errors = self._client.remove_objects(self.bucket, batch)
-                        failed = 0
-                        for err in errors:
-                            failed += 1
-                            print(
-                                f"[minio][trim][warn] remove {getattr(err, 'object_name', '?')}: {getattr(err, 'message', err)}"
-                            )
-                        deleted_total += len(batch) - failed
-                    return deleted_total, visited
-                except Exception as e:
-                    print(f"[minio][trim][error] prefix={prefix} {e}")
-                    return deleted_total, visited
-
-            start_monotonic = time.monotonic()
-            deleted, scanned = await self._run_in_executor(
-                self._trim_executor, _trim_batch
-            )
-            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
-            if deleted > 0:
-                await self.increment_frame_count(safe_id, -deleted)
-            rest_est = max(curr_count - deleted, 0)
-            print(
-                f"[minio][trim] prefix={prefix} target={to_delete} scanned={scanned} deleted={deleted} rest_est={rest_est} keep={keep_last_n}"
-            )
-            if self._monitor_callback and deleted >= 0:
-                self._monitor_callback(safe_id, "minio_trim", elapsed_ms)
-            return deleted
-        finally:
-            renew_stop.set()
-            if renew_task:
-                try:
-                    await renew_task
-                except Exception as e:
-                    print(f"[redis][warn] lock renew task error {lock_key}: {e}")
-            await self._release_lock(lock_key, token)
-
-    async def increment_frame_count(self, safe_id: str, delta: int) -> int:
-        return await self._redis_hincrby(self.counts_key, safe_id, delta)
-
-    async def get_frame_count(self, safe_id: str) -> int:
-        return await self._redis_hget(self.counts_key, safe_id)
-
-    async def set_frame_count(self, safe_id: str, value: int) -> bool:
-        return await self._redis_hset(self.counts_key, safe_id, int(value))
-
-    async def _redis_hincrby(self, key: str, field: str, delta: int) -> int:
-        try:
-            result = await self._run_in_executor(
-                self._io_executor, self._redis.hincrby, key, field, delta
-            )
-            return int(result)
-        except Exception as e:
-            print(f"[redis][error] hincrby {key} {field} {delta}: {e}")
-            return -1
-
-    async def _redis_hget(self, key: str, field: str) -> int:
-        try:
-            value = await self._run_in_executor(
-                self._io_executor, self._redis.hget, key, field
-            )
-            if value is None:
-                return -1
-            if isinstance(value, bytes):
-                try:
-                    value = value.decode("utf-8")
-                except Exception:
-                    pass
-            return int(value)
-        except (TypeError, ValueError):
-            return -1
-        except Exception as e:
-            print(f"[redis][error] hget {key} {field}: {e}")
-            return -1
-
-    async def _redis_hset(self, key: str, field: str, value: int) -> bool:
-        try:
-            await self._run_in_executor(
-                self._io_executor, self._redis.hset, key, field, int(value)
-            )
-            return True
-        except Exception as e:
-            print(f"[redis][error] hset {key} {field} {value}: {e}")
-            return False
-
-    async def _acquire_lock(self, lock_key: str, token: str) -> bool:
-        ttl = max(self.trim_lock_ttl, 1) if self.trim_lock_ttl > 0 else None
-        try:
-            result = await self._run_in_executor(
-                self._io_executor,
-                self._redis.set,
-                lock_key,
-                token,
-                nx=True,
-                ex=ttl,
-            )
-            return bool(result)
-        except Exception as e:
-            print(f"[redis][error] set {lock_key}: {e}")
-            return False
-
-    async def _release_lock(self, lock_key: str, token: str) -> bool:
-        try:
-            result = await self._run_in_executor(
-                self._io_executor,
-                self._release_lock_script,
-                keys=[lock_key],
-                args=[token],
-            )
-            return int(result or 0) > 0
-        except Exception as e:
-            print(f"[redis][error] release lock {lock_key}: {e}")
-            return False
-
-    async def _extend_lock(self, lock_key: str, token: str, ttl: int) -> bool:
-        try:
-            curr = await self._run_in_executor(self._io_executor, self._redis.get, lock_key)
-            if curr != token:
-                return False
-            result = await self._run_in_executor(
-                self._io_executor, self._redis.expire, lock_key, max(ttl, 1)
-            )
-            return bool(result)
-        except Exception as e:
-            print(f"[redis][error] expire {lock_key}: {e}")
-            return False
+        async with self._ring_lock:
+            current = self._ring_ptr.get(safe_id, -1)
+            next_index = (current + 1) % ring_size
+            self._ring_ptr[safe_id] = next_index
+            return next_index
 
     async def _run_in_executor(
         self, executor: concurrent.futures.Executor, func: Callable, *args, **kwargs
@@ -515,39 +312,20 @@ MINIO_MONITOR_CALLBACK: Callable[[str, str, float], None] | None = (
 )
 
 MINIO_MANAGER = MinioManager(
-    r,
     endpoint=MINIO_ENDPOINT,
     access_key=MINIO_ACCESS_KEY,
     secret_key=MINIO_SECRET_KEY,
     bucket=MINIO_BUCKET,
     secure=MINIO_SECURE,
-    counts_key=MINIO_COUNTS_KEY,
-    ring_index_key=MINIO_RING_INDEX_KEY,
-    trim_lock_prefix=MINIO_TRIM_LOCK_PREFIX,
-    trim_lock_ttl=MINIO_TRIM_LOCK_TTL,
-    trim_batch=MINIO_TRIM_BATCH,
-    trim_max_delete=MINIO_TRIM_MAX_DELETE,
+    lifecycle_days=MINIO_LIFECYCLE_DAYS,
     io_executor=EXECUTOR_IO,
     upload_executor=MINIO_UPLOAD_EXECUTOR,
-    trim_executor=MINIO_TRIM_EXECUTOR,
-    ring_enabled=MINIO_RING_ENABLED,
     monitor_callback=MINIO_MONITOR_CALLBACK,
 )
 
 # ★ 安全文件名生成器
 def safe_filename(stream_name: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_-]', "_", stream_name)
-
-
-def build_obj_key(stream_name: str, ts_ms: int) -> str:
-    """
-    构造对象键：{safe_id}/{13位零填充毫秒时间戳}[ _intrussion].jpg
-    13位零填充能保证按 object_name 的字典序即时间序。
-    """
-    safe_id = safe_filename(stream_name)
-    stamp = f"{ts_ms:013d}"  # 始终 13 位，例如 001723... 保证字典序=时间序
-    tail = "_intrussion" if MINIO_USE_INTRUSSION_SUFFIX else ""
-    return f"{safe_id}/{stamp}{tail}.jpg"
 
 
 def build_ring_obj_key(safe_id: str, slot_index: int) -> str:
@@ -761,49 +539,26 @@ async def stream_worker(stream_name: str):
 
             # ========== MinIO: 仍然写“原始 JPEG”，不做叠加/再编码 ==========
             raw_jpeg = jpeg
-            ts_ms = int(time.time() * 1000)
-            obj_key = build_obj_key(stream_name, ts_ms)
 
             # 保存策略：若你只想异常时写 -> 环境变量设 MINIO_SAVE_MODE=abnormal
             save_this = (MINIO_SAVE_MODE == "all") or (MINIO_SAVE_MODE == "abnormal" and is_abnormal)
             _minio_pending_refs: List[dict] = []
             upload_durations: List[float] = []
-            if save_this and MINIO_MANAGER.is_ready:
+            if (
+                save_this
+                and MINIO_MANAGER.is_ready
+                and MINIO_MAX_FRAMES_PER_STREAM > 0
+            ):
                 safe_id = safe_filename(stream_name)
-                primary_obj_key: Optional[str] = None
                 primary_reason = "abnormal" if is_abnormal else "all"
-
-                if MINIO_RING_ENABLED and MINIO_MAX_FRAMES_PER_STREAM > 0:
-                    slot_index = await MINIO_MANAGER.assign_ring_slot(
-                        safe_id, MINIO_MAX_FRAMES_PER_STREAM
-                    )
-                    if slot_index is not None:
-                        ring_key = build_ring_obj_key(safe_id, slot_index)
-                        t_upload_start = time.monotonic()
-                        etag = await MINIO_MANAGER.put_bytes(
-                            ring_key, raw_jpeg, content_type="image/jpeg"
-                        )
-                        if etag:
-                            upload_ms = (time.monotonic() - t_upload_start) * 1000.0
-                            upload_durations.append(upload_ms)
-                            _minio_pending_refs.append(
-                                {
-                                    "type": "frame",
-                                    "key": ring_key,
-                                    "minio_object_key": ring_key,
-                                    "etag": etag,
-                                    "reason": primary_reason,
-                                }
-                            )
-                            primary_obj_key = ring_key
-                            await MINIO_MANAGER.record_ring_success(
-                                safe_id, MINIO_MAX_FRAMES_PER_STREAM
-                            )
-
-                if primary_obj_key is None:
+                slot_index = await MINIO_MANAGER.next_ring_slot(
+                    safe_id, MINIO_MAX_FRAMES_PER_STREAM
+                )
+                if slot_index is not None:
+                    ring_key = build_ring_obj_key(safe_id, slot_index)
                     t_upload_start = time.monotonic()
                     etag = await MINIO_MANAGER.put_bytes(
-                        obj_key, raw_jpeg, content_type="image/jpeg"
+                        ring_key, raw_jpeg, content_type="image/jpeg"
                     )
                     if etag:
                         upload_ms = (time.monotonic() - t_upload_start) * 1000.0
@@ -811,38 +566,12 @@ async def stream_worker(stream_name: str):
                         _minio_pending_refs.append(
                             {
                                 "type": "frame",
-                                "key": obj_key,
-                                "minio_object_key": obj_key,
+                                "key": ring_key,
+                                "minio_object_key": ring_key,
                                 "etag": etag,
                                 "reason": primary_reason,
                             }
                         )
-                        primary_obj_key = obj_key
-                        if MINIO_RING_ENABLED and MINIO_MAX_FRAMES_PER_STREAM > 0:
-                            await MINIO_MANAGER.record_ring_success(
-                                safe_id, MINIO_MAX_FRAMES_PER_STREAM
-                            )
-                        else:
-                            new_count = await MINIO_MANAGER.increment_frame_count(
-                                safe_id, 1
-                            )
-                            if (
-                                MINIO_TRIM_INTERVAL > 0
-                                and new_count > 0
-                                and new_count % MINIO_TRIM_INTERVAL == 0
-                            ):
-
-                                async def _trim_task():
-                                    try:
-                                        await MINIO_MANAGER.trim_prefix(
-                                            prefix=f"{safe_id}/",
-                                            keep_last_n=MINIO_MAX_FRAMES_PER_STREAM,
-                                            safe_id=safe_id,
-                                        )
-                                    except Exception as e:
-                                        print(f"[minio][trim][error] task {safe_id}: {e}")
-
-                                asyncio.create_task(_trim_task())
 
                 if MONITORING_ENABLED and upload_durations:
                     PERFORMANCE_MONITOR.record_stage(
