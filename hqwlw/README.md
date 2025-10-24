@@ -25,45 +25,55 @@ python visualize_performance_metrics.py snapshot.json --title "离线性能报�
 
 ## MinIO 存储策略
 
-- 通过配置项 `minio.ring_enabled` 可在环形覆盖缓存与批量删除两种策略之间切换。开启环形模式后，每路流仅复用 `max_frames_per_stream` 个键名槽位，新帧会覆盖最旧槽位。
-- 环形模式下帧文件仅保留在环形槽位内，不再额外按时间戳写入异常帧副本，从而降低存储占用；性能监控的 `minio_trim` 指标仍仅在关闭环形模式时上报。
-- 项目提供 `MinioManager` 类（位于 `camera_check_fastapi/src/main.py`）统一封装上传、环形缓存与清理操作，其他模块可直接复用。
+- 系统始终以环形槽位（`safe_id/ring/{slot:06d}[ _intrussion].jpg`）覆写方式保存帧数据，不再额外生成时间戳文件，也无需手动修剪对象。
+- 槽位指针通过 `MinioManager.next_ring_slot` 在进程内以异步锁维护，既避免了 Redis 依赖，又确保并发写入不会重复使用槽位。
+- `MinioManager.initialize()` 会在桶创建后自动配置生命周期策略。生命周期天数优先读取 `config_settings.minio.lifecycle_days`，其次读取环境变量 `MINIO_LIFECYCLE_DAYS`，默认值为 3 天。
+
+### 在其他模块中调用 MinioManager
+
+```python
+import asyncio
+from camera_check_fastapi.src.main import MINIO_MANAGER, safe_filename, build_ring_obj_key
+
+async def save_alarm_frame(stream_name: str, jpeg_bytes: bytes) -> None:
+    if not MINIO_MANAGER.is_ready:
+        return
+    safe_id = safe_filename(stream_name)
+    slot = await MINIO_MANAGER.next_ring_slot(safe_id, ring_size=120)
+    if slot is None:
+        return
+    ring_key = build_ring_obj_key(safe_id, slot)
+    await MINIO_MANAGER.put_bytes(ring_key, jpeg_bytes)
+
+# 在 FastAPI 背景任务或其他协程上下文中调用
+asyncio.create_task(save_alarm_frame("camera001", jpeg_bytes))
+```
 
 ### MinioManager 使用示例
 
 ```python
-from camera_check_fastapi.src.main import MinioManager
-from redis import Redis
 from concurrent.futures import ThreadPoolExecutor
-
-redis_client = Redis(host="127.0.0.1", port=6379, decode_responses=True)
+from camera_check_fastapi.src.main import MinioManager, build_ring_obj_key
 
 manager = MinioManager(
-    redis_client,
     endpoint="127.0.0.1:9000",
     access_key="minioadmin",
     secret_key="minioadmin",
     bucket="frames",
     secure=False,
-    counts_key="minio:counts",
-    ring_index_key="minio:ring:index",
-    trim_lock_prefix="minio:trim:lock:",
-    trim_lock_ttl=180,
-    trim_batch=1000,
-    trim_max_delete=2000,
+    lifecycle_days=7,  # 超过 7 天的对象将由 MinIO 自动清理
     io_executor=ThreadPoolExecutor(max_workers=32),
     upload_executor=ThreadPoolExecutor(max_workers=16),
-    trim_executor=ThreadPoolExecutor(max_workers=8),
-    ring_enabled=True,
 )
 
 manager.initialize()
 
-if manager.is_ready:
-    etag = await manager.put_bytes("camera001/latest.jpg", jpeg_bytes)
-    slot = await manager.assign_ring_slot("camera001", ring_size=120)
-    await manager.record_ring_success("camera001", ring_size=120)
-    await manager.trim_prefix("camera001/", keep_last_n=120, safe_id="camera001")
+async def write_frame(jpeg_bytes: bytes) -> None:
+    slot = await manager.next_ring_slot("camera001", ring_size=120)
+    if slot is None:
+        return
+    key = build_ring_obj_key("camera001", slot)
+    await manager.put_bytes(key, jpeg_bytes)
 ```
 
 
