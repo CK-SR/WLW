@@ -239,30 +239,46 @@ class MinioManager:
     def _apply_lifecycle_policy(self) -> None:
         if not self._client or self.lifecycle_days <= 0:
             return
+
+        days = int(self.lifecycle_days)
+
+        # 1) 优先：对象 API（新 SDK）
         try:
-            if LifecycleConfig and Rule and Expiration and Filter:
-                rule = Rule(
-                    "expire-all",
-                    status="Enabled",
-                    expiration=Expiration(days=int(self.lifecycle_days)),
-                    filter=Filter(prefix=""),
-                )
-                config = LifecycleConfig(rules=[rule])
-                self._client.set_bucket_lifecycle(self.bucket, config)
-            else:
-                days = int(self.lifecycle_days)
-                xml = (
-                    "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
-                    "<Rule><ID>expire-all</ID><Status>Enabled</Status>"
-                    f"<Filter><Prefix></Prefix></Filter><Expiration><Days>{days}</Days></Expiration>"
-                    "</Rule></LifecycleConfiguration>"
-                )
-                self._client.set_bucket_lifecycle(self.bucket, xml)
-            print(
-                f"[minio] lifecycle configured: expire after {self.lifecycle_days} days"
+            from minio.lifecycleconfig import LifecycleConfig, Rule, Expiration
+            try:
+                # 有些版本在 lifecycleconfig 里就有 Filter
+                from minio.lifecycleconfig import Filter as _Filter
+            except ImportError:
+                # 另一些版本在 commonconfig 里
+                from minio.commonconfig import Filter as _Filter
+
+            # 注意：新版本参数名是 rule_filter
+            rule = Rule(
+                rule_id="expire-all",
+                status="Enabled",
+                rule_filter=_Filter(prefix=""),
+                expiration=Expiration(days=days),
             )
-        except Exception as e:
-            print(f"[minio][warn] set lifecycle failed: {e}")
+            config = LifecycleConfig([rule])
+            self._client.set_bucket_lifecycle(self.bucket, config)
+            print(f"[minio] lifecycle configured (object API): expire after {days} days")
+            return
+
+        except Exception as e_obj:
+            # 2) 旧 SDK Fallback：XML
+            xml = (
+                '<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+                "<Rule><ID>expire-all</ID><Status>Enabled</Status>"
+                "<Filter><Prefix></Prefix></Filter>"
+                f"<Expiration><Days>{days}</Days></Expiration>"
+                "</Rule></LifecycleConfiguration>"
+            )
+            try:
+                self._client.set_bucket_lifecycle(self.bucket, xml)
+                print(f"[minio] lifecycle configured (XML fallback): expire after {days} days")
+            except Exception as e_xml:
+                print(f"[minio][warn] set lifecycle failed: {e_obj} | xml_fallback_error: {e_xml}")
+
 
     async def put_bytes(
         self, obj_key: str, data: bytes, content_type: str = "image/jpeg"
