@@ -12,13 +12,17 @@ from pathlib import Path
 # =============== 导入所有业务 router 和 lifespan ===============
 from areaIntrusion_fastapi.src.area_interface import router as area_router
 from areaIntrusion_fastapi.src.area_interface import lifespan as area_lifespan
-from fire_fastapi.fire_interface_redis import router as fire_redis_router
+#from fire_fastapi.fire_interface_redis import router as fire_redis_router
+from fire_fastapi_new.fire_interface import router as fire_router
 from camera_check_fastapi.src.main import router as camera_check_router
 from face_fastapi.face_redis import router as face_redis_router
 from face_fastapi.face_image_ebd_updata import router as face_image_ebd_updata_router
 from dashboard_fastapi.dashboard_redis import router as dashboard_redis_router
 from pose_fastapi_new.pose_interface import router as pose_pipeline_router
 from configs.settings import settings as config_settings
+from zhiliu_paihuai_fastapi.zhiliu_paihuai import router as zhiliu_paihuai_router
+from zhiliu_paihuai_fastapi.zhiliu_paihuai import lifespan as zhiliu_paihuai_lifespan
+
 
 LOG_DIR = getattr(getattr(config_settings, "logging", None), "dir", "/var/log/app")
 Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -33,12 +37,13 @@ logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers)
 # =============== 统一注册表（router + lifespan） ===============
 ROUTER_REGISTRY: Dict[str, Dict[str, Any]] = {
     "area": {"router": area_router, "lifespan": area_lifespan},
-    "pose_pipeline": {"router": pose_pipeline_router},
-    "fire_redis": {"router": fire_redis_router},
+    "pose": {"router": pose_pipeline_router},
+    "fire_redis": {"router": fire_router},
     "camera": {"router": camera_check_router},
     "face": {"router": face_redis_router},
     "face_ebd": {"router": face_image_ebd_updata_router},
     "dashboard": {"router": dashboard_redis_router},
+    "zhiliu_paihuai": {"router": zhiliu_paihuai_router, "lifespan": zhiliu_paihuai_lifespan}
 }
 
 

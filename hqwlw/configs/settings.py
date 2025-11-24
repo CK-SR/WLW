@@ -16,6 +16,11 @@ class ModelsConfig(BaseModel):
     insightface_root: str
     insightface_name: str
     yolo_path: str
+    face_data: str
+    # 可选：姿态/行为类别名称映射（按索引顺序）
+    pose_class_names: list[str] = Field(default_factory=list)
+    # 可选：环境异常检测类别名称映射（按索引顺序），如 ["fire","smoke","water"]
+    fire_class_names: list[str] = Field(default_factory=list)
 
 class RedisConfig(BaseModel):
     host: str
@@ -36,6 +41,11 @@ class ServerSettings(BaseSettings):
     threads: int = 5
     timeout: int = 0
 
+class MinIOConfig(BaseSettings):
+    minio_endpoint: str
+    minio_access_key: str
+    minio_secret_key: str
+    
 class LoggingSettings(BaseSettings):
     dir: str = "/workspace/logs"
     level: str = "info"
@@ -73,12 +83,16 @@ class MonitoringSettings(BaseModel):
     history_size: int = 120
     frame_history: int = 60
 
+class FramehubSettings(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 8080
+
 
 class Settings(BaseModel):
     env: str
     redis: RedisConfig
     models: ModelsConfig
-    server: ServerConfig
+    #server: ServerConfig
     server: ServerSettings = ServerSettings()
     logging: LoggingSettings = LoggingSettings()
     kafka: KafkaSettings = KafkaSettings()
@@ -86,6 +100,7 @@ class Settings(BaseModel):
     minio: MinioSettings = MinioSettings()
     stream: StreamSettings = StreamSettings()
     monitoring: MonitoringSettings = MonitoringSettings()
+    framehub: FramehubSettings = FramehubSettings()
 
 
 def _apply_env_overrides(settings: Settings) -> Settings:

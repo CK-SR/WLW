@@ -10,6 +10,15 @@ models:
   insightface_root: /home/cs/hqwlw_zsh/
   insightface_name: buffalo_l
   yolo_path: /home/cs/hqwlw_zsh/models
+  face_data: /home/cs/hqwlw_zsh/data
+  pose_class_names:
+    - somking
+    - calling
+    - climb
+    - jump
+    - run
+    - takephoto
+    - walk
 
 server:
   host: 0.0.0.0
@@ -38,11 +47,11 @@ minio:
   secret_key: minioadmin123
   bucket: camera-checkout
   secure: false
-  ring_enabled: false
-  max_frames_per_stream: 1000
+  ring_enabled: true
+  max_frames_per_stream: 10
   trim_interval: 400
-  use_intrussion_suffix: true
-  save_mode: all
+  use_intrussion_suffix: false
+  save_mode: abnormal
   sample_fps: 1.0
   jpeg_quality: 85
 
@@ -53,3 +62,7 @@ monitoring:
   enabled: true
   history_size: 240
   frame_history: 120
+
+framehub:
+  host: 192.168.130.162
+  port: 7000

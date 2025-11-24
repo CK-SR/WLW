@@ -1,0 +1,16 @@
+role: user
+content: |
+  Study the person in this image crop and choose the single best action label from the allowed set.
+  If the view is unclear, pick the closest plausible label and explain why.
+  Answer strictly with minified JSON using the schema:
+  {"class_id": <int>, "class_name": "<label>", "confidence": <float 0-1>}
+  Keep the rationale concise (<=40 words). Do not include any extra text before or after the JSON.
+  Reference cues for each label:
+  - 0 smoking: fingers near the mouth or a clearly held cigarette.
+  - 1 calling: a hand placed against the ear as if holding a phone.
+  - 2 climb: the person is climbing a wall, window, or similar vertical surface.
+  - 3 jump: arms swinging up or down with a crouched or airborne posture.
+  - 4 run: vigorous arm swings with rapid, crossing strides that signal sprinting.
+  - 5 takephoto: phone held up in front of the face with raised arms.
+  - 6 walk: movement is slow or moderate with relaxed limbs, lacking jump or run intensity.
+  - 7 carry: the person is holding or hugging a box or other noticeable item while moving.

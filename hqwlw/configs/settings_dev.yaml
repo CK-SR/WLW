@@ -1,4 +1,4 @@
-# configs/settings_local.yaml
+# configs/settings_dev.yaml
 env: local
 
 redis:
@@ -10,7 +10,19 @@ models:
   insightface_root: /workspace
   insightface_name: buffalo_l
   yolo_path: /workspace/models
-
+  face_data: /workspace/data
+  pose_class_names:
+    - somking
+    - calling
+    - climb
+    - jump
+    - run
+    - takephoto
+    - walk
+  fire_class_names:
+    - fire
+    - smoke
+    - water
 server:
   host: 0.0.0.0
   port: 5011
@@ -35,10 +47,10 @@ minio:
   secret_key: minioadmin123
   bucket: camera-checkout
   secure: false
-  ring_enabled: false
-  max_frames_per_stream: 1000
+  ring_enabled: true
+  max_frames_per_stream: 10
   trim_interval: 400
-  use_intrussion_suffix: true
+  use_intrussion_suffix: false
   save_mode: all
   sample_fps: 1.0
   jpeg_quality: 85
@@ -50,4 +62,3 @@ monitoring:
   enabled: true
   history_size: 240
   frame_history: 120
-

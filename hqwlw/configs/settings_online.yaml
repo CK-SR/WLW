@@ -1,4 +1,4 @@
-# configs/settings_local.yaml
+# configs/settings_online.yaml
 env: local
 
 redis:
@@ -10,11 +10,23 @@ models:
   insightface_root: /workspace
   insightface_name: buffalo_l
   yolo_path: /workspace/models
-
+  face_data: /workspace/data
+  pose_class_names:
+    - somking
+    - calling
+    - climb
+    - jump
+    - run
+    - takephoto
+    - walk
+  fire_class_names:
+    - fire
+    - smoke
+    - water
 server:
   host: 0.0.0.0
   port: 5011
-  workers: 1           # gunicorn workers 数量，默认 1
+  workers: 1         # gunicorn workers 数量，默认 1
   threads: 5         # 每个 worker 的线程数，默认 5
   timeout: 0         # 请求超时时间，0 表示不超时，适合长连接/流式接口
 
@@ -30,16 +42,16 @@ i18n:
     - zh-CN
 
 minio:
-  endpoint: 192.168.130.162:9100
+  endpoint: 4.1.9.10:9100
   access_key: minioadmin
   secret_key: minioadmin123
   bucket: camera-checkout
   secure: false
-  ring_enabled: false
+  ring_enabled: true
   max_frames_per_stream: 1000
   trim_interval: 400
-  use_intrussion_suffix: true
-  save_mode: all
+  use_intrussion_suffix: false
+  save_mode: abnormal
   sample_fps: 1.0
   jpeg_quality: 85
 

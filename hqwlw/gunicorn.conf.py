@@ -24,7 +24,11 @@ loglevel = config_settings.logging.level
 
 
 # 日志配置：写到文件
-preload_app  = True
+# Preloading can cause deadlocks/crashes when heavy models or
+# thread pools are created at import-time (before forking workers).
+# Our services (e.g., dashboard, area intrusion) create ThreadPoolExecutors
+# and load YOLO models on import, so avoid preloading.
+preload_app  = False
 worker_class = "uvicorn.workers.UvicornWorker"
 
 # 关键：写文件 + 控制台同时启用
