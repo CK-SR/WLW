@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  action-detection-vllm:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: action-detection-vllm
+    working_dir: /workspace
+    entrypoint:
+      - gunicorn
+      - -k
+      - uvicorn.workers.UvicornWorker
+      - -c
+      - gunicorn.conf.py
+      - action_detection_vllm.service.api:app
+    ports:
+      - "5011:5011"
+    environment:
+      APP_ENV: "local"
+      CONFIG_PATH: "/workspace/action_detection_vllm/config/config.yaml"
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - type: bind
+        source: /home/cs/hqwlw_zsh/models
+        target: /workspace/models
+        read_only: true
+      - type: bind
+        source: /home/cs/hqwlw_zsh/data/logs
+        target: /workspace/logs
+        read_only: false
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: ["gpu"]
