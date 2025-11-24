@@ -1,0 +1,24 @@
+redis:
+  host: 192.168.130.14
+  port: 6379
+  stream_prefix: "frames:"
+vllm:
+  base_url: "http://192.168.130.14:8010/v1"
+  model: "/model/Qwen3-VL-8B-Instruct"
+  max_workers: 8
+yolo:
+  model_path: "/workspace/models/yolo11m.pt"
+  conf: 0.7
+  device: null
+prompt:
+  action_classes_path: "/workspace/action_detection_vllm/prompt/data.yaml"
+  system_path: "/workspace/action_detection_vllm/prompt/system.yaml"
+  user_path: "/workspace/action_detection_vllm/prompt/user.yaml"
+thresholds:
+  crop_min_short_side: 256
+  box_expand_ratio: 0.4
+  top_k: 1
+pipeline:
+  frame_interval: 1
+  timeout_sec: 1.0
+  max_frames: null
