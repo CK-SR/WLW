@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from run_qwen_action_pipeline_vllm import create_pipeline
+from pipeline_qwen_lzy import set_upload_all_frames, set_upload_annotated
 
 app = FastAPI(title="异常行为检测", version="v1")
 router = APIRouter(prefix="/pose_pipeline", tags=["pose-pipeline"])
@@ -42,6 +43,14 @@ class StartRequest(BaseModel):
     discover_all: bool = False
     stream_prefix: str = "frames:"
     cameras: List[str] = []   # 例如 ["frames:rtsp://192.168.1.10:8554/cam01", ...]
+
+
+class UploadModeRequest(BaseModel):
+    upload_all_frames: bool
+
+
+class AnnotatedModeRequest(BaseModel):
+    upload_annotated: bool
 
 
 class SubStatus(BaseModel):
@@ -204,7 +213,20 @@ async def pipeline_stop():
     return manager.get_status()
 
 
-# ====== 4. WebSocket /pose_pipeline/ws ======
+# ====== 4. 上传策略切换 ======
+@router.post("/pipeline/upload_mode")
+async def update_upload_mode(req: UploadModeRequest):
+    """切换是否上传全量帧。"""
+    return set_upload_all_frames(req.upload_all_frames)
+
+
+@router.post("/pipeline/annotation_mode")
+async def update_annotation_mode(req: AnnotatedModeRequest):
+    """切换上传的帧是否带标注。"""
+    return set_upload_annotated(req.upload_annotated)
+
+
+# ====== 5. WebSocket /pose_pipeline/ws ======
 @router.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
     await websocket.accept()

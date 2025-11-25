@@ -64,6 +64,7 @@ class MinioSettings(BaseModel):
     access_key: str = "minioadmin"
     secret_key: str = "minioadmin123"
     bucket: str = "camera-checkout"
+    action_bucket: str | None = None
     secure: bool = False
     ring_enabled: bool = False
     max_frames_per_stream: int = 1000
@@ -111,6 +112,7 @@ def _apply_env_overrides(settings: Settings) -> Settings:
         "minio.access_key": ("MINIO_ACCESS_KEY", str),
         "minio.secret_key": ("MINIO_SECRET_KEY", str),
         "minio.bucket": ("MINIO_BUCKET", str),
+        "minio.action_bucket": ("MINIO_ACTION_BUCKET", str),
         "minio.secure": ("MINIO_SECURE", lambda v: str(v).lower() in {"1", "true", "yes"}),
         "minio.ring_enabled": ("MINIO_RING_ENABLED", lambda v: str(v).lower() in {"1", "true", "yes"}),
         "minio.max_frames_per_stream": ("MINIO_MAX_FRAMES_PER_STREAM", int),
