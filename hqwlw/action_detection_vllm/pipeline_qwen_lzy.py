@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import asyncio
 import threading
 
@@ -47,11 +47,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     yaml = None
 
-from camera_check_fastapi.src.main import (
-    MINIO_MANAGER,
-    MINIO_MAX_FRAMES_PER_STREAM,
-    safe_filename,
-)
+from camera_check_fastapi.src.main import MinioManager, safe_filename
 
 
 DEFAULT_ACTION_CLASSES: Dict[int, str] = {
@@ -65,8 +61,37 @@ DEFAULT_ACTION_CLASSES: Dict[int, str] = {
     7: "carry",
 }
 
+PRIMARY_MINIO_BUCKET = str(getattr(config_settings.minio, "bucket", "") or "")
+
+
+def _resolve_action_bucket() -> str:
+    bucket = getattr(config_settings.minio, "action_bucket", None)
+    if not bucket:
+        bucket = f"{PRIMARY_MINIO_BUCKET}-action" if PRIMARY_MINIO_BUCKET else "action-detection"
+    if bucket == PRIMARY_MINIO_BUCKET:
+        bucket = f"{bucket}-ad"
+    return bucket
+
+
+def _resolve_minio_lifecycle_days() -> int:
+    if hasattr(config_settings.minio, "lifecycle_days"):
+        value = getattr(config_settings.minio, "lifecycle_days")
+        if value not in (None, ""):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    env_value = os.getenv("MINIO_LIFECYCLE_DAYS")
+    if env_value not in (None, ""):
+        try:
+            return int(env_value)
+        except ValueError:
+            pass
+    return 3
+
+
 MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", False))
-MINIO_RING_SIZE = int(getattr(config_settings.minio, "max_frames_per_stream", MINIO_MAX_FRAMES_PER_STREAM))
+MINIO_RING_SIZE = int(getattr(config_settings.minio, "max_frames_per_stream", 0))
 MINIO_JPEG_QUALITY = int(getattr(config_settings.minio, "jpeg_quality", 85))
 DEFAULT_UPLOAD_ALL_FRAMES = str(getattr(config_settings.minio, "save_mode", "all")).lower() == "all"
 
@@ -170,6 +195,37 @@ class PersonActionResult:
     qwen_action: QwenAction
 
 EXECUTOR_IO = concurrent.futures.ThreadPoolExecutor(max_workers=64)
+ACTION_MINIO_UPLOAD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=32)
+
+ACTION_MINIO_ENDPOINT = config_settings.minio.endpoint
+ACTION_MINIO_ACCESS_KEY = config_settings.minio.access_key
+ACTION_MINIO_SECRET_KEY = config_settings.minio.secret_key
+ACTION_MINIO_BUCKET = _resolve_action_bucket()
+ACTION_MINIO_SECURE = bool(config_settings.minio.secure)
+ACTION_MINIO_LIFECYCLE_DAYS = _resolve_minio_lifecycle_days()
+
+MINIO_MONITOR_CALLBACK: Callable[[str, str, float], None] | None = (
+    (lambda safe_id, stage, duration: PERFORMANCE_MONITOR.record_stage(safe_id, stage, duration))
+    if MONITORING_ENABLED
+    else None
+)
+
+
+class ActionMinioManager(MinioManager):
+    """Dedicated MinIO manager instance for action detection uploads."""
+
+
+MINIO_MANAGER = ActionMinioManager(
+    endpoint=ACTION_MINIO_ENDPOINT,
+    access_key=ACTION_MINIO_ACCESS_KEY,
+    secret_key=ACTION_MINIO_SECRET_KEY,
+    bucket=ACTION_MINIO_BUCKET,
+    secure=ACTION_MINIO_SECURE,
+    lifecycle_days=ACTION_MINIO_LIFECYCLE_DAYS,
+    io_executor=EXECUTOR_IO,
+    upload_executor=ACTION_MINIO_UPLOAD_EXECUTOR,
+    monitor_callback=MINIO_MONITOR_CALLBACK,
+)
 r = redis.Redis(
     host="192.168.130.14",
     port=6379,
