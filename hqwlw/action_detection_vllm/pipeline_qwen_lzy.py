@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import asyncio
+import threading
 
 
 import cv2
@@ -46,6 +47,12 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     yaml = None
 
+from camera_check_fastapi.src.main import (
+    MINIO_MANAGER,
+    MINIO_MAX_FRAMES_PER_STREAM,
+    safe_filename,
+)
+
 
 DEFAULT_ACTION_CLASSES: Dict[int, str] = {
     0: "smoking",
@@ -57,6 +64,50 @@ DEFAULT_ACTION_CLASSES: Dict[int, str] = {
     6: "walk",
     7: "carry",
 }
+
+MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", False))
+MINIO_RING_SIZE = int(getattr(config_settings.minio, "max_frames_per_stream", MINIO_MAX_FRAMES_PER_STREAM))
+MINIO_JPEG_QUALITY = int(getattr(config_settings.minio, "jpeg_quality", 85))
+DEFAULT_UPLOAD_ALL_FRAMES = str(getattr(config_settings.minio, "save_mode", "all")).lower() == "all"
+
+
+class UploadPreferences:
+    def __init__(self) -> None:
+        self.upload_all_frames: bool = DEFAULT_UPLOAD_ALL_FRAMES
+        self.upload_annotated: bool = True
+        self._lock = threading.Lock()
+
+    def set_upload_all_frames(self, enabled: bool) -> None:
+        with self._lock:
+            self.upload_all_frames = bool(enabled)
+
+    def set_upload_annotated(self, enabled: bool) -> None:
+        with self._lock:
+            self.upload_annotated = bool(enabled)
+
+    def snapshot(self) -> Dict[str, bool]:
+        with self._lock:
+            return {
+                "upload_all_frames": self.upload_all_frames,
+                "upload_annotated": self.upload_annotated,
+            }
+
+
+UPLOAD_PREFS = UploadPreferences()
+
+
+def set_upload_all_frames(enabled: bool) -> Dict[str, bool]:
+    UPLOAD_PREFS.set_upload_all_frames(enabled)
+    return UPLOAD_PREFS.snapshot()
+
+
+def set_upload_annotated(enabled: bool) -> Dict[str, bool]:
+    UPLOAD_PREFS.set_upload_annotated(enabled)
+    return UPLOAD_PREFS.snapshot()
+
+
+def get_upload_preferences() -> Dict[str, bool]:
+    return UPLOAD_PREFS.snapshot()
 
 
 def _parse_iso_to_epoch(ts: Optional[str]) -> Optional[float]:
@@ -338,6 +389,82 @@ def _img_ndarray_to_data_url(
     encode_ms = (t1 - t0) * 1000.0
 
     return data_url, encode_ms, len(jpeg_bytes)
+
+
+def _run_coroutine_sync(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+
+def _ensure_minio_ready() -> bool:
+    if MINIO_MANAGER.is_ready:
+        return True
+    MINIO_MANAGER.initialize()
+    return MINIO_MANAGER.is_ready
+
+
+def _encode_jpeg_bytes(image: np.ndarray, quality: int = MINIO_JPEG_QUALITY) -> Optional[bytes]:
+    ok, buf = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        return None
+    return buf.tobytes()
+
+
+def _build_frame_obj_key(
+    safe_id: str, frame_idx: int, msg_id: Optional[str], annotated: bool
+) -> str:
+    suffix = "annotated" if annotated else "raw"
+    if MINIO_RING_ENABLED and MINIO_RING_SIZE > 0:
+        slot_index = _run_coroutine_sync(
+            MINIO_MANAGER.next_ring_slot(safe_id, MINIO_RING_SIZE)
+        )
+        if slot_index is not None:
+            return f"{safe_id}/ring/{slot_index:06d}_{suffix}.jpg"
+
+    ts = datetime.utcnow().strftime("%Y%m%d/%H%M%S_%f")
+    msg_part = msg_id.replace(":", "_") if msg_id else f"f{frame_idx:06d}"
+    return f"{safe_id}/frames/{ts}_{msg_part}_{suffix}.jpg"
+
+
+def _build_crop_obj_key(
+    safe_id: str, frame_idx: int, person_id: int, msg_id: Optional[str]
+) -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d/%H%M%S_%f")
+    msg_part = msg_id.replace(":", "_") if msg_id else f"f{frame_idx:06d}"
+    return f"{safe_id}/crops/{ts}_{msg_part}_p{person_id:02d}.jpg"
+
+
+def _upload_image_bytes(obj_key: str, data: Optional[bytes]) -> Optional[str]:
+    if not data or not _ensure_minio_ready():
+        return None
+    return _run_coroutine_sync(MINIO_MANAGER.put_bytes(obj_key, data))
+
+
+def _upload_frame_to_minio(
+    safe_id: str, frame_idx: int, msg_id: Optional[str],
+    image: np.ndarray, annotated: bool
+) -> Optional[str]:
+    jpeg = _encode_jpeg_bytes(image, MINIO_JPEG_QUALITY)
+    obj_key = _build_frame_obj_key(safe_id, frame_idx, msg_id, annotated)
+    etag = _upload_image_bytes(obj_key, jpeg)
+    return obj_key if etag else None
+
+
+def _upload_crop_to_minio(
+    safe_id: str, frame_idx: int, person_id: int, msg_id: Optional[str], crop: np.ndarray
+) -> Optional[str]:
+    jpeg = _encode_jpeg_bytes(crop, MINIO_JPEG_QUALITY)
+    obj_key = _build_crop_obj_key(safe_id, frame_idx, person_id, msg_id)
+    etag = _upload_image_bytes(obj_key, jpeg)
+    return obj_key if etag else None
 
 
 def _call_vllm_chat(
@@ -683,13 +810,10 @@ class QwenPersonActionPipeline:
         if not cap.isOpened():
             raise RuntimeError(f"Could not open video: {video_path}")
 
-        save_root = Path(output_dir) if output_dir else None
-        if save_root:
+        safe_id = safe_filename(video_path)
+        save_root = Path(output_dir) if output_dir and save_video else None
+        if save_root and save_video:
             save_root.mkdir(parents=True, exist_ok=True)
-        if save_root and save_crops:
-            (save_root / "crops").mkdir(parents=True, exist_ok=True)
-        if save_root and save_anno:
-            (save_root / "annotated_frames").mkdir(parents=True, exist_ok=True)
 
         video_output_path: Optional[Path] = None
         writer: Optional[cv2.VideoWriter] = None
@@ -730,6 +854,9 @@ class QwenPersonActionPipeline:
                 print(f"Frame {frame_idx}: Detected {len(detections)} persons")
                 print(f"detections: {detections}")
                 if not detections:
+                    prefs = UPLOAD_PREFS.snapshot()
+                    if prefs.get("upload_all_frames", False):
+                        _upload_frame_to_minio(safe_id, frame_idx, None, frame, False)
                     continue
 
                 per_frame_results: List[Dict[str, Any]] = []
@@ -749,10 +876,10 @@ class QwenPersonActionPipeline:
                     )
 
                     crop_path = None
-                    if save_root and save_crops:
-                        crop_name = f"frame_{frame_idx:06d}_person_{person_id:02d}.jpg"
-                        crop_path = str(save_root / "crops" / crop_name)
-                        cv2.imwrite(crop_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if save_crops:
+                        crop_path = _upload_crop_to_minio(
+                            safe_id, frame_idx, person_id, None, crop
+                        )
 
                     # 用线程池并发调用 vLLM
                     future = self._vllm_executor.submit(
@@ -814,9 +941,15 @@ class QwenPersonActionPipeline:
                 )
 
                 has_detections = bool(per_frame_results)
+                prefs = UPLOAD_PREFS.snapshot()
+                upload_all_frames = prefs.get("upload_all_frames", False)
+                upload_annotated = prefs.get("upload_annotated", True)
+                should_upload_frame = upload_all_frames or has_detections
                 need_video_frame = video_output_path is not None
-                need_image_frame = bool(save_root and save_anno and has_detections)
-                if need_video_frame or need_image_frame:
+                need_annotated_image = (upload_annotated and should_upload_frame) or need_video_frame
+
+                annotated = None
+                if need_annotated_image:
                     annotated = frame.copy()
                     if has_detections:
                         for person_data in per_frame_results:
@@ -840,16 +973,26 @@ class QwenPersonActionPipeline:
                                     lineType=cv2.LINE_AA,
                                 )
 
-                    if need_video_frame:
-                        if writer is None and video_output_path is not None:
-                            frame_size = (annotated.shape[1], annotated.shape[0])
-                            writer = _create_video_writer(video_output_path, fps, frame_size)
-                        if writer is not None:
-                            writer.write(annotated)
+                if should_upload_frame:
+                    target_image = (
+                        annotated
+                        if (upload_annotated and annotated is not None and has_detections)
+                        else frame
+                    )
+                    _upload_frame_to_minio(
+                        safe_id,
+                        frame_idx,
+                        None,
+                        target_image,
+                        upload_annotated and has_detections,
+                    )
 
-                    if need_image_frame and save_root is not None:
-                        annotated_name = f"frame_{frame_idx:06d}.jpg"
-                        cv2.imwrite(str(save_root / "annotated_frames" / annotated_name), annotated)
+                if need_video_frame and annotated is not None:
+                    if writer is None and video_output_path is not None:
+                        frame_size = (annotated.shape[1], annotated.shape[0])
+                        writer = _create_video_writer(video_output_path, fps, frame_size)
+                    if writer is not None:
+                        writer.write(annotated)
         finally:
             cap.release()
             if writer is not None:
@@ -878,13 +1021,10 @@ class QwenPersonActionPipeline:
         """
         从 Redis 中的帧流（frames:{stream_name}）读取视频帧进行处理。
         """
-        save_root = Path(output_dir) if output_dir else None
-        if save_root:
+        safe_id = safe_filename(stream_key)
+        save_root = Path(output_dir) if output_dir and save_video else None
+        if save_root and save_video:
             save_root.mkdir(parents=True, exist_ok=True)
-        if save_root and save_crops:
-            (save_root / "crops").mkdir(parents=True, exist_ok=True)
-        if save_root and save_anno:
-            (save_root / "annotated_frames").mkdir(parents=True, exist_ok=True)
 
         video_output_path: Optional[Path] = None
         writer: Optional[cv2.VideoWriter] = None
@@ -981,6 +1121,9 @@ class QwenPersonActionPipeline:
                 detection_ms = (t_detect_end - t_detect_start) * 1000.0
                 print(f"[stream {stream_key}] Frame {frame_idx}: Detected {len(detections)} persons")
                 if not detections:
+                    prefs = UPLOAD_PREFS.snapshot()
+                    if prefs.get("upload_all_frames", False):
+                        _upload_frame_to_minio(safe_id, frame_idx, msg_id, frame, False)
                     if MONITORING_ENABLED:
                         ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
                         ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
@@ -1023,10 +1166,10 @@ class QwenPersonActionPipeline:
                     crop, _, _ = _ensure_min_short_side(crop, crop_min_short_side)
 
                     crop_path = None
-                    if save_root and save_crops:
-                        crop_name = f"frame_{frame_idx:06d}_person_{person_id:02d}.jpg"
-                        crop_path = str(save_root / "crops" / crop_name)
-                        cv2.imwrite(crop_path, crop, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if save_crops:
+                        crop_path = _upload_crop_to_minio(
+                            safe_id, frame_idx, person_id, msg_id, crop
+                        )
 
                     future = self._vllm_executor.submit(
                         self._classify_action_with_qwen, crop
@@ -1130,10 +1273,15 @@ class QwenPersonActionPipeline:
                         print(f"[stream {stream_key}] on_result callback failed: {e}")
 
                 has_detections = bool(per_frame_results)
+                prefs = UPLOAD_PREFS.snapshot()
+                upload_all_frames = prefs.get("upload_all_frames", False)
+                upload_annotated = prefs.get("upload_annotated", True)
+                should_upload_frame = upload_all_frames or has_detections
                 need_video_frame = save_root is not None and save_video
-                need_image_frame = bool(save_root and save_anno and has_detections)
+                need_annotated_image = (upload_annotated and should_upload_frame) or need_video_frame
 
-                if need_video_frame or need_image_frame:
+                annotated = None
+                if need_annotated_image:
                     annotated = frame.copy()
                     if has_detections:
                         for person_data in per_frame_results:
@@ -1157,18 +1305,28 @@ class QwenPersonActionPipeline:
                                     lineType=cv2.LINE_AA,
                                 )
 
-                    if need_video_frame:
-                        if writer is None:
-                            if save_root is not None:
-                                video_output_path = (save_root / annotated_video_name).with_suffix(".mp4")
-                                video_output_path.parent.mkdir(parents=True, exist_ok=True)
-                            frame_size = (annotated.shape[1], annotated.shape[0])
-                            writer = _create_video_writer(video_output_path, fps, frame_size)
-                        writer.write(annotated)
+                if should_upload_frame:
+                    target_image = (
+                        annotated
+                        if (upload_annotated and annotated is not None and has_detections)
+                        else frame
+                    )
+                    _upload_frame_to_minio(
+                        safe_id,
+                        frame_idx,
+                        msg_id,
+                        target_image,
+                        upload_annotated and has_detections,
+                    )
 
-                    if need_image_frame and save_root is not None:
-                        annotated_name = f"frame_{frame_idx:06d}.jpg"
-                        cv2.imwrite(str(save_root / "annotated_frames" / annotated_name), annotated)
+                if need_video_frame and annotated is not None:
+                    if writer is None:
+                        if save_root is not None:
+                            video_output_path = (save_root / annotated_video_name).with_suffix(".mp4")
+                            video_output_path.parent.mkdir(parents=True, exist_ok=True)
+                        frame_size = (annotated.shape[1], annotated.shape[0])
+                        writer = _create_video_writer(video_output_path, fps, frame_size)
+                    writer.write(annotated)
 
                 processing_end = time.perf_counter()
                 processing_ms = (processing_end - decode_start) * 1000.0
@@ -1214,4 +1372,7 @@ __all__ = [
     "PersonActionResult",
     "QwenAction",
     "GroundingResult",
+    "set_upload_all_frames",
+    "set_upload_annotated",
+    "get_upload_preferences",
 ]
