@@ -133,7 +133,7 @@ def _read_one_from_redis(stream_key: str, block_ms: int = 1000):
     注意：这里的参数现在是完整的 Redis Stream key，例如：
         "frames:rtsp://192.168.1.10:8554/cam01"
     """
-    return r.xread({stream_key: "$"}, count=1, block=block_ms) or []
+    return r.xread({f"frames:{stream_key}": "$"}, count=1, block=block_ms) or []
 
 
 async def get_one_frame(stream_key: str, timeout_sec: float = 1.0):
