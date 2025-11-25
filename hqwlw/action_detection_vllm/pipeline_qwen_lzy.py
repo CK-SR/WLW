@@ -214,6 +214,30 @@ MINIO_MONITOR_CALLBACK: Callable[[str, str, float], None] | None = (
 class ActionMinioManager(MinioManager):
     """Dedicated MinIO manager instance for action detection uploads."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        # 使用线程锁来维护环形索引，避免基类中的 asyncio.Lock 绑定到不同事件循环时
+        # 引发 RuntimeError。
+        import threading
+
+        self._ring_lock_sync = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+    async def next_ring_slot(self, safe_id: str, ring_size: int) -> Optional[int]:
+        """
+        返回下一个环形缓冲区槽位。
+
+        与基类不同，使用线程锁以跨线程安全的方式维护计数器，避免 asyncio.Lock
+        在不同事件循环下被重复使用导致的错误。
+        """
+        if ring_size <= 0:
+            return None
+
+        with self._ring_lock_sync:
+            current = self._ring_ptr.get(safe_id, -1)
+            next_index = (current + 1) % ring_size
+            self._ring_ptr[safe_id] = next_index
+            return next_index
+
 
 MINIO_MANAGER = ActionMinioManager(
     endpoint=ACTION_MINIO_ENDPOINT,
@@ -450,7 +474,11 @@ def _img_ndarray_to_data_url(
 def _run_coroutine_sync(coro):
     try:
         return asyncio.run(coro)
-    except RuntimeError:
+    except RuntimeError as e:
+        # 仅在当前线程已有事件循环时进行兜底处理，避免对已执行过的协程二次 await。
+        if "asyncio.run() cannot be called" not in str(e):
+            raise
+
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
