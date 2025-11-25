@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -14,8 +15,8 @@ import numpy as np
 import torch
 from PIL import Image
 import redis
-#from configs.settings import settings as config_settings
-#from camera_check_fastapi.src.performance import PERFORMANCE_MONITOR
+from configs.settings import settings as config_settings
+from camera_check_fastapi.src.performance import PERFORMANCE_MONITOR
 # from transformers import (
 #     AutoModelForZeroShotObjectDetection,
 #     AutoProcessor,
@@ -56,6 +57,31 @@ DEFAULT_ACTION_CLASSES: Dict[int, str] = {
     6: "walk",
     7: "carry",
 }
+
+
+def _parse_iso_to_epoch(ts: Optional[str]) -> Optional[float]:
+    """Parse ISO-8601 or numeric timestamp string to epoch seconds."""
+
+    if ts is None:
+        return None
+    try:
+        return float(ts)
+    except Exception:
+        pass
+    try:
+        return datetime.fromisoformat(str(ts)).timestamp()
+    except Exception:
+        return None
+
+
+MONITORING_ENABLED = bool(config_settings.monitoring.enabled)
+if MONITORING_ENABLED:
+    PERFORMANCE_MONITOR.configure(
+        history_size=int(config_settings.monitoring.history_size),
+        frame_history=int(config_settings.monitoring.frame_history),
+    )
+else:
+    PERFORMANCE_MONITOR.reset()
 
 
 @dataclass
@@ -112,7 +138,7 @@ def _read_one_from_redis(stream_key: str, block_ms: int = 1000):
 
 async def get_one_frame(stream_key: str, timeout_sec: float = 1.0):
     """
-    从指定的 Redis Stream key 读取一条记录，返回 (msg_id, meta, jpeg)。
+    从指定的 Redis Stream key 读取一条记录，返回 (msg_id, meta, jpeg, redis_ms)。
 
     :param stream_key: 完整的 Redis key，例如 "frames:rtsp://192.168.1.10:8554/cam01"
     """
@@ -124,17 +150,20 @@ async def get_one_frame(stream_key: str, timeout_sec: float = 1.0):
             EXECUTOR_IO, _read_one_from_redis, stream_key, int(timeout_sec * 1000)
         )
         if streams:
+            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
             print(f"[redis] got frame for {stream_key}")
             for _stream, messages in streams:
                 for _id, fields in messages:
                     meta = json.loads(fields[b"meta"].decode("utf-8"))
                     jpeg = fields[b"jpeg"]
                     msg_id = _id.decode() if isinstance(_id, bytes) else str(_id)
-                    return msg_id, meta, jpeg
+                    if MONITORING_ENABLED:
+                        PERFORMANCE_MONITOR.record_stage(stream_key, "redis_fetch", elapsed_ms)
+                    return msg_id, meta, jpeg, elapsed_ms
         else:
             print(f"[redis] no frame for {stream_key}, retry...")
         await asyncio.sleep(0.01)
-    return None, None, None
+    return None, None, None, None
 
 def _load_class_names(data_config: Optional[str]) -> Dict[int, str]:
     if not data_config:
@@ -890,15 +919,48 @@ class QwenPersonActionPipeline:
                     break
 
                 # === 使用新版 get_one_frame，从 Redis 读一帧 ===
-                msg_id, meta, jpeg = asyncio.run(get_one_frame(stream_key, timeout_sec=timeout_sec))
+                fetch_start = time.perf_counter()
+                msg_id, meta, jpeg, redis_fetch_ms = asyncio.run(
+                    get_one_frame(stream_key, timeout_sec=timeout_sec)
+                )
+                fetch_end = time.perf_counter()
+                if redis_fetch_ms is None:
+                    redis_fetch_ms = (fetch_end - fetch_start) * 1000.0
                 if jpeg is None:
                     print(f"[stream {stream_key}] timeout {timeout_sec}s, no frame, stop.")
                     break
 
+                decode_start = time.perf_counter()
+
                 np_buf = np.frombuffer(jpeg, dtype=np.uint8)
                 frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+                decode_end = time.perf_counter()
+                decode_ms = (decode_end - decode_start) * 1000.0
                 if frame is None:
                     print(f"[stream {stream_key}] decode failed, skip this frame.")
+                    if MONITORING_ENABLED:
+                        ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
+                        ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
+                        ts3_epoch = time.time()
+                        cap_ms = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
+                        queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
+                        e2e_ms = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
+                        PERFORMANCE_MONITOR.record_frame(
+                            stream_key,
+                            {
+                                "capture": cap_ms,
+                                "queue": queue_ms,
+                                "redis_fetch": redis_fetch_ms,
+                                "decode": decode_ms,
+                                "detection": None,
+                                "vllm_batch": None,
+                                "processing": None,
+                                "end_to_end": e2e_ms,
+                            },
+                            msg_id=msg_id,
+                            frame_index=frame_idx,
+                            persons=0,
+                        )
                     continue
 
                 frame_idx += 1
@@ -913,13 +975,43 @@ class QwenPersonActionPipeline:
                 frame_pil = Image.fromarray(frame_rgb)
                 img_width, img_height = frame_pil.size
 
+                t_detect_start = time.perf_counter()
                 detections = self._detect_with_grounding(frame_pil)
+                t_detect_end = time.perf_counter()
+                detection_ms = (t_detect_end - t_detect_start) * 1000.0
                 print(f"[stream {stream_key}] Frame {frame_idx}: Detected {len(detections)} persons")
                 if not detections:
+                    if MONITORING_ENABLED:
+                        ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
+                        ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
+                        ts3_epoch = time.time()
+                        cap_ms = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
+                        queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
+                        processing_ms = (t_detect_end - decode_start) * 1000.0
+                        e2e_ms = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
+                        PERFORMANCE_MONITOR.record_frame(
+                            stream_key,
+                            {
+                                "capture": cap_ms,
+                                "queue": queue_ms,
+                                "redis_fetch": redis_fetch_ms,
+                                "decode": decode_ms,
+                                "detection": detection_ms,
+                                "vllm_batch": None,
+                                "processing": processing_ms,
+                                "end_to_end": e2e_ms,
+                            },
+                            msg_id=msg_id,
+                            frame_index=frame_idx,
+                            persons=0,
+                        )
                     continue
 
                 per_frame_results: List[Dict[str, Any]] = []
                 person_jobs: List[Dict[str, Any]] = []
+                qwen_http_times: List[float] = []
+                qwen_total_times: List[float] = []
+                qwen_parse_times: List[float] = []
 
                 t_batch_start = time.perf_counter()
 
@@ -962,6 +1054,13 @@ class QwenPersonActionPipeline:
 
                     qwen_action: QwenAction = future.result()
 
+                    if qwen_action.timings.get("http_ms") is not None:
+                        qwen_http_times.append(float(qwen_action.timings["http_ms"]))
+                    if qwen_action.timings.get("total_ms") is not None:
+                        qwen_total_times.append(float(qwen_action.timings["total_ms"]))
+                    if qwen_action.timings.get("parse_json_ms") is not None:
+                        qwen_parse_times.append(float(qwen_action.timings["parse_json_ms"]))
+
                     per_frame_results.append(
                         {
                             "expanded_box": (x1, y1, x2, y2),
@@ -1003,6 +1102,9 @@ class QwenPersonActionPipeline:
 
                 t_batch_end = time.perf_counter()
                 batch_ms = (t_batch_end - t_batch_start) * 1000.0
+                qwen_http_ms = max(qwen_http_times) if qwen_http_times else None
+                qwen_total_ms = max(qwen_total_times) if qwen_total_times else None
+                qwen_parse_ms = max(qwen_parse_times) if qwen_parse_times else None
                 print(
                     f"[stream {stream_key}] vLLM batch for {len(person_jobs)} persons "
                     f"took {batch_ms:.2f} ms (workers={self._vllm_workers})"
@@ -1019,8 +1121,8 @@ class QwenPersonActionPipeline:
                             "detections": detections_payload,
                             "latency": {
                                 # 这里只把我们掌握的一点信息塞进去，其它字段可按需扩展
-                                "infer_ms": qwen_action.timings.get("http_ms", 0.0) if person_jobs else 0.0,
-                                "post_ms": qwen_action.timings.get("parse_json_ms", 0.0) if person_jobs else 0.0,
+                                "infer_ms": qwen_http_ms or 0.0,
+                                "post_ms": qwen_parse_ms or 0.0,
                             },
                         }
                         on_result(payload)
@@ -1067,6 +1169,36 @@ class QwenPersonActionPipeline:
                     if need_image_frame and save_root is not None:
                         annotated_name = f"frame_{frame_idx:06d}.jpg"
                         cv2.imwrite(str(save_root / "annotated_frames" / annotated_name), annotated)
+
+                processing_end = time.perf_counter()
+                processing_ms = (processing_end - decode_start) * 1000.0
+
+                if MONITORING_ENABLED:
+                    ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
+                    ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
+                    ts3_epoch = time.time()
+                    cap_ms = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
+                    queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
+                    e2e_ms = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
+                    PERFORMANCE_MONITOR.record_frame(
+                        stream_key,
+                        {
+                            "capture": cap_ms,
+                            "queue": queue_ms,
+                            "redis_fetch": redis_fetch_ms,
+                            "decode": decode_ms,
+                            "detection": detection_ms,
+                            "vllm_batch": batch_ms,
+                            "vllm_http": qwen_http_ms,
+                            "vllm_parse": qwen_parse_ms,
+                            "vllm_total": qwen_total_ms,
+                            "processing": processing_ms,
+                            "end_to_end": e2e_ms,
+                        },
+                        msg_id=msg_id,
+                        frame_index=frame_idx,
+                        persons=len(person_jobs),
+                    )
 
         finally:
             if writer is not None:
