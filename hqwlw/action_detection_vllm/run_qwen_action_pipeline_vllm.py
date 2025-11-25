@@ -2,7 +2,7 @@
 from pathlib import Path
 import os
 
-from pipeline_qwen_lzy import QwenPersonActionPipeline
+from action_detection_vllm.pipeline_qwen_lzy import QwenPersonActionPipeline
 
 
 def create_pipeline() -> QwenPersonActionPipeline:
@@ -23,7 +23,7 @@ def create_pipeline() -> QwenPersonActionPipeline:
         system_prompt_path="/workspace/action_detection_vllm/prompt/system.yaml",
         user_prompt_path="/workspace/action_detection_vllm/prompt/user.yaml",
         data_config="/home/cs/leiheao/dataengine/data_10_28_datav6.yaml",
-        device="cuda",
+        device="cuda:2",
         qwen_device="cuda",
         qwen_model_name="Qwen3-VL",
     )

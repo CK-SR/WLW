@@ -10,8 +10,8 @@ from fastapi import FastAPI, APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from run_qwen_action_pipeline_vllm import create_pipeline
-from pipeline_qwen_lzy import set_upload_all_frames, set_upload_annotated
+from action_detection_vllm.run_qwen_action_pipeline_vllm import create_pipeline
+from action_detection_vllm.pipeline_qwen_lzy import set_upload_all_frames, set_upload_annotated
 
 app = FastAPI(title="异常行为检测", version="v1")
 router = APIRouter(prefix="/pose_pipeline", tags=["pose-pipeline"])
@@ -116,7 +116,7 @@ class PosePipelineManager:
         """
         根据 discover_all / stream_prefix / cameras 创建线程并启动。
         """
-        from pipeline_qwen_lzy import r  # 用你原来的 redis 连接
+        from action_detection_vllm.pipeline_qwen_lzy import r  # 用你原来的 redis 连接
 
         with self._lock:
             if self.running:
