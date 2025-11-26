@@ -93,7 +93,8 @@ def _resolve_minio_lifecycle_days() -> int:
 MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", False))
 MINIO_RING_SIZE = int(getattr(config_settings.minio, "max_frames_per_stream", 0))
 MINIO_JPEG_QUALITY = int(getattr(config_settings.minio, "jpeg_quality", 85))
-DEFAULT_UPLOAD_ALL_FRAMES = str(getattr(config_settings.minio, "save_mode", "all")).lower() == "all"
+#DEFAULT_UPLOAD_ALL_FRAMES = str(getattr(config_settings.minio, "save_mode", "all")).lower() == "all"
+DEFAULT_UPLOAD_ALL_FRAMES = False
 
 
 class UploadPreferences:
@@ -260,19 +261,18 @@ r = redis.Redis(
 
 
 def _read_one_from_redis(stream_key: str, block_ms: int = 1000):
-    """
-    注意：这里的参数现在是完整的 Redis Stream key，例如：
-        "frames:rtsp://192.168.1.10:8554/cam01"
-    """
+
+    #print("get_one_frame_stream_key:"+str(stream_key))
+
     return r.xread({f"frames:{stream_key}": "$"}, count=1, block=block_ms) or []
 
 
 async def get_one_frame(stream_key: str, timeout_sec: float = 1.0):
-    """
-    从指定的 Redis Stream key 读取一条记录，返回 (msg_id, meta, jpeg, redis_ms)。
+    
+    #print("get_one_frame_stream_key:"+str(stream_key))
 
-    :param stream_key: 完整的 Redis key，例如 "frames:rtsp://192.168.1.10:8554/cam01"
-    """
+
+
     loop = asyncio.get_running_loop()
     deadline = time.time() + timeout_sec
     start_monotonic = time.monotonic()
@@ -623,7 +623,8 @@ class QwenPersonActionPipeline:
         #     grounding_model_id
         # ).to(self._device)
 
-        self._grounding_model = YOLO("/workspace/models/yolo11m.pt").to(self._device)
+        #self._grounding_model = YOLO("/workspace/models/yolo11n.pt").to(self._device)
+        self._grounding_model = YOLO("yolo11m.pt").to(self._device)
 
         self._class_names = _load_class_names(data_config) or DEFAULT_ACTION_CLASSES
         self._class_name_to_id = {
@@ -660,38 +661,7 @@ class QwenPersonActionPipeline:
         # ==== 新增：每路流一个 stop_flag，用于 /stop 控制 ====
         self._stop_flags: Dict[str, bool] = {}
 
-    # def _detect_with_grounding(self, frame_pil: Image.Image) -> List[GroundingResult]:
-    #     inputs = self._processor(
-    #         images=frame_pil, text=self._text_query, return_tensors="pt"
-    #     ).to(self._device)
 
-    #     with torch.inference_mode():
-    #         outputs = self._grounding_model(**inputs)
-
-    #     post_processed = self._processor.post_process_grounded_object_detection(
-    #         outputs,
-    #         input_ids=inputs.input_ids,
-    #         threshold=self._grounding_threshold,
-    #         text_threshold=self._text_threshold,
-    #         target_sizes=[frame_pil.size[::-1]],
-    #     )
-
-    #     results: List[GroundingResult] = []
-    #     if not post_processed:
-    #         return results
-
-    #     data = post_processed[0]
-    #     scores = data.get("scores", [])
-    #     labels = data.get("labels", [])
-    #     boxes = data.get("boxes", [])
-    #     for score, label, box in zip(scores, labels, boxes):
-    #         label_text = str(label).lower()
-    #         if "person" not in label_text:
-    #             continue
-    #         results.append(
-    #             GroundingResult(box_xyxy=tuple(box.tolist()), score=float(score), label=label)
-    #         )
-    #     return results
 
     def _detect_with_grounding(self, frame_pil: Image.Image) -> List[GroundingResult]:
         results = self._grounding_model(frame_pil, conf=self._grounding_threshold, classes=[0])  # 0=COCO person
@@ -873,218 +843,6 @@ class QwenPersonActionPipeline:
             meta=meta,
         )
 
-    def process_video(
-        self,
-        video_path: str,
-        output_dir: Optional[str] = None,
-        frame_interval: int = 1,
-        box_expand_ratio: float = 0.4,
-        crop_min_short_side: int = 448,
-        save_crops: bool = True,
-        save_anno: bool = True,
-        save_video: bool = True,
-        top_k: int = 1,
-        annotated_video_name: str = "annotated",
-    ) -> List[PersonActionResult]:
-        video_path = str(video_path)
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video not found: {video_path}")
-
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            raise RuntimeError(f"Could not open video: {video_path}")
-
-        safe_id = safe_filename(video_path)
-        save_root = Path(output_dir) if output_dir and save_video else None
-        if save_root and save_video:
-            save_root.mkdir(parents=True, exist_ok=True)
-
-        video_output_path: Optional[Path] = None
-        writer: Optional[cv2.VideoWriter] = None
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        if save_root and save_video:
-            video_output_path = (save_root / annotated_video_name).with_suffix(".mp4")
-            video_output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        results: List[PersonActionResult] = []
-        frame_idx = 0
-        top_k = max(1, int(top_k))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        progress = None
-        if tqdm is not None:
-            progress = tqdm(
-                total=total_frames if total_frames > 0 else None,
-                desc="Processing video frames",
-                unit="frame",
-            )
-
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if progress is not None:
-                    progress.update(1)
-
-                frame_idx += 1
-                if frame_idx % frame_interval != 0:
-                    continue
-
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_pil = Image.fromarray(frame_rgb)
-                img_width, img_height = frame_pil.size
-
-                detections = self._detect_with_grounding(frame_pil)
-                print(f"Frame {frame_idx}: Detected {len(detections)} persons")
-                print(f"detections: {detections}")
-                if not detections:
-                    prefs = UPLOAD_PREFS.snapshot()
-                    if prefs.get("upload_all_frames", False):
-                        _upload_frame_to_minio(safe_id, frame_idx, None, frame, False)
-                    continue
-
-                per_frame_results: List[Dict[str, Any]] = []
-
-                # === (A) 准备每个人的裁剪和 meta 信息，同时提交 vLLM 任务 ===
-                person_jobs: List[Dict[str, Any]] = []
-
-                t_batch_start = time.perf_counter()
-
-                for person_id, detection in enumerate(detections):
-                    x1, y1, x2, y2 = _expand_box(
-                        detection.box_xyxy, box_expand_ratio, img_width, img_height
-                    )
-                    crop = frame[y1:y2, x1:x2].copy()
-                    crop, _, _ = _ensure_min_short_side(
-                        crop, crop_min_short_side
-                    )
-
-                    crop_path = None
-                    if save_crops:
-                        crop_path = _upload_crop_to_minio(
-                            safe_id, frame_idx, person_id, None, crop
-                        )
-
-                    # 用线程池并发调用 vLLM
-                    future = self._vllm_executor.submit(
-                        self._classify_action_with_qwen, crop
-                    )
-
-                    person_jobs.append(
-                        {
-                            "person_id": person_id,
-                            "detection": detection,
-                            "box": (x1, y1, x2, y2),
-                            "crop_path": crop_path,
-                            "future": future,
-                        }
-                    )
-
-                # === (B) 等待所有 vLLM 结果返回，并填充 per_frame_results / results ===
-                for job in person_jobs:
-                    person_id = job["person_id"]
-                    detection = job["detection"]
-                    x1, y1, x2, y2 = job["box"]
-                    crop_path = job["crop_path"]
-                    future = job["future"]
-
-                    # .result() 会在必要时阻塞，但多个请求是在并发进行的
-                    qwen_action: QwenAction = future.result()
-
-                    per_frame_results.append(
-                        {
-                            "expanded_box": (x1, y1, x2, y2),
-                            "preds": [
-                                {
-                                    "class_name": qwen_action.class_name,
-                                    "confidence": qwen_action.confidence,
-                                    "rationale": qwen_action.rationale,
-                                }
-                            ],
-                        }
-                    )
-
-                    results.append(
-                        PersonActionResult(
-                            frame_index=frame_idx,
-                            person_index=person_id,
-                            box_xyxy=(x1, y1, x2, y2),
-                            grounding_score=detection.score,
-                            crop_path=crop_path,
-                            qwen_action=qwen_action,
-                        )
-                    )
-
-                t_batch_end = time.perf_counter()
-                batch_ms = (t_batch_end - t_batch_start) * 1000.0
-
-                # 简单打个 log 看看这一帧 vLLM 总耗时（并发后是“批次耗时”）
-                print(
-                    f"[Frame {frame_idx}] vLLM batch for {len(person_jobs)} persons "
-                    f"took {batch_ms:.2f} ms (workers={self._vllm_workers})"
-                )
-
-                has_detections = bool(per_frame_results)
-                prefs = UPLOAD_PREFS.snapshot()
-                upload_all_frames = prefs.get("upload_all_frames", False)
-                upload_annotated = prefs.get("upload_annotated", True)
-                should_upload_frame = upload_all_frames or has_detections
-                need_video_frame = video_output_path is not None
-                need_annotated_image = (upload_annotated and should_upload_frame) or need_video_frame
-
-                annotated = None
-                if need_annotated_image:
-                    annotated = frame.copy()
-                    if has_detections:
-                        for person_data in per_frame_results:
-                            x1, y1, x2, y2 = person_data["expanded_box"]
-                            cv2.rectangle(annotated, (x1, y1), (x2, y2), (80, 200, 80), 2)
-                            preds = person_data.get("preds", [])
-                            for rank, pred in enumerate(preds[:top_k]):
-                                label_text = pred.get("class_name") or "unknown"
-                                conf = pred.get("confidence")
-                                if conf is not None:
-                                    label_text += f" {conf * 100:.1f}%"
-                                y_anchor = max(15, y1 - 10 - rank * 18)
-                                cv2.putText(
-                                    annotated,
-                                    label_text,
-                                    (x1, y_anchor),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    (50, 220, 50),
-                                    2,
-                                    lineType=cv2.LINE_AA,
-                                )
-
-                if should_upload_frame:
-                    target_image = (
-                        annotated
-                        if (upload_annotated and annotated is not None and has_detections)
-                        else frame
-                    )
-                    _upload_frame_to_minio(
-                        safe_id,
-                        frame_idx,
-                        None,
-                        target_image,
-                        upload_annotated and has_detections,
-                    )
-
-                if need_video_frame and annotated is not None:
-                    if writer is None and video_output_path is not None:
-                        frame_size = (annotated.shape[1], annotated.shape[0])
-                        writer = _create_video_writer(video_output_path, fps, frame_size)
-                    if writer is not None:
-                        writer.write(annotated)
-        finally:
-            cap.release()
-            if writer is not None:
-                writer.release()
-            if progress is not None:
-                progress.close()
-
-        return results
 
     def process_stream(
         self,

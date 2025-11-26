@@ -97,8 +97,8 @@ class PosePipelineManager:
                 box_expand_ratio=0.4,
                 crop_min_short_side=256,
                 save_crops=False,
-                save_anno=True,
-                save_video=True,
+                save_anno=False,
+                save_video=False,
                 top_k=1,
                 annotated_video_name="annotated_qwen",
                 max_frames=None,           # 一直跑，直到 /stop

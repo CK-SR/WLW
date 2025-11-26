@@ -7,7 +7,7 @@ from action_detection_vllm.pipeline_qwen_lzy import QwenPersonActionPipeline
 
 def create_pipeline() -> QwenPersonActionPipeline:
     # vLLM 环境变量
-    os.environ["VLLM_BASE_URL"] = "http://192.168.130.14:8010/v1"
+    os.environ["VLLM_BASE_URL"] = "http://192.168.130.162:8010/v1"
     os.environ["VLLM_MODEL"]    = "/model/Qwen3-VL-2B-Instruct-FP8"
 
     os.environ["QWEN_MAX_NEW_TOKENS"] = "128"
