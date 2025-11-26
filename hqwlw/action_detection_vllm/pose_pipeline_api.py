@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -11,7 +13,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from action_detection_vllm.run_qwen_action_pipeline_vllm import create_pipeline
-from action_detection_vllm.pipeline_qwen_lzy import set_upload_all_frames, set_upload_annotated
+from action_detection_vllm.pipeline_qwen_lzy import ACTIVITY_TRACKER, set_upload_all_frames, set_upload_annotated
 
 app = FastAPI(title="异常行为检测", version="v1")
 router = APIRouter(prefix="/pose_pipeline", tags=["pose-pipeline"])
@@ -71,9 +73,26 @@ class PosePipelineManager:
         self._threads: Dict[str, threading.Thread] = {}
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._monitor_thread: Optional[threading.Thread] = None
+        self._monitor_stop = threading.Event()
+        self._monitor_interval = 3600.0
+        self._log_dir = Path("./performance_logs")
 
     def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
+
+    def _run_monitor(self) -> None:
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        while not self._monitor_stop.wait(self._monitor_interval):
+            snapshot = ACTIVITY_TRACKER.snapshot_last_hour()
+            file_name = datetime.utcnow().strftime("performance_%Y%m%d_%H%M%S.json")
+            target = self._log_dir / file_name
+            try:
+                target.write_text(
+                    json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            except Exception as exc:
+                print(f"[monitor] failed to write performance snapshot: {exc}")
 
     def _run_one_stream(self, stream_key: str) -> None:
         """
@@ -124,6 +143,14 @@ class PosePipelineManager:
                 return
             self.running = True
             self.stream_prefix = req.stream_prefix
+            ACTIVITY_TRACKER.reset()
+            self._monitor_stop.clear()
+            if self._monitor_thread is None or not self._monitor_thread.is_alive():
+                self._monitor_thread = threading.Thread(
+                    target=self._run_monitor,
+                    daemon=True,
+                )
+                self._monitor_thread.start()
 
             # 决定要跑哪些 stream_key
             if req.discover_all:
@@ -154,9 +181,16 @@ class PosePipelineManager:
         """
         通知所有流水线停止。真正退出要等各线程在下一轮循环检查到 stop_flag。
         """
+        monitor_thread: Optional[threading.Thread] = None
         with self._lock:
             self.running = False
             PIPELINE.request_stop()  # 通知所有 stream 停止
+            self._monitor_stop.set()
+            monitor_thread = self._monitor_thread
+        if monitor_thread and monitor_thread.is_alive():
+            monitor_thread.join(timeout=1.0)
+        with self._lock:
+            self._monitor_thread = None
 
     def get_status(self) -> PipelineStatus:
         # framesource / inference 按是否有线程在跑来判断
