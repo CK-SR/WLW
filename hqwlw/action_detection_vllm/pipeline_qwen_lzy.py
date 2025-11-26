@@ -7,6 +7,7 @@ from datetime import datetime
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from collections import defaultdict, deque
 import asyncio
 import threading
 
@@ -159,6 +160,65 @@ if MONITORING_ENABLED:
     )
 else:
     PERFORMANCE_MONITOR.reset()
+
+
+class HourlyActivityTracker:
+    """Track per-stream activity within a rolling time window."""
+
+    def __init__(self, window_seconds: int = 3600) -> None:
+        self._window_seconds = window_seconds
+        self._events = defaultdict(
+            lambda: {"processed": deque(), "vllm": deque(), "minio": deque()}
+        )
+        self._lock = threading.RLock()
+
+    def _trim(self, queue: deque, cutoff: float) -> None:
+        while queue and queue[0] < cutoff:
+            queue.popleft()
+
+    def record_event(self, stream: str, event: str) -> None:
+        if not stream:
+            return
+        now = time.time()
+        cutoff = now - self._window_seconds
+        with self._lock:
+            buckets = self._events[stream]
+            for key in ("processed", "vllm", "minio"):
+                buckets.setdefault(key, deque())
+            for bucket in buckets.values():
+                self._trim(bucket, cutoff)
+            if event in buckets:
+                buckets[event].append(now)
+
+    def snapshot_last_hour(self) -> Dict[str, object]:
+        now = time.time()
+        cutoff = now - self._window_seconds
+        summary: Dict[str, Dict[str, int]] = {}
+        with self._lock:
+            for stream, buckets in self._events.items():
+                for key in ("processed", "vllm", "minio"):
+                    buckets.setdefault(key, deque())
+                for bucket in buckets.values():
+                    self._trim(bucket, cutoff)
+                summary[stream] = {
+                    "frames_processed": len(buckets["processed"]),
+                    "vllm_frames": len(buckets["vllm"]),
+                    "minio_frames": len(buckets["minio"]),
+                }
+            active_streams = sum(1 for data in summary.values() if any(data.values()))
+            return {
+                "generated_at": datetime.utcnow().isoformat(),
+                "window_seconds": self._window_seconds,
+                "stream_count": active_streams,
+                "streams": summary,
+            }
+
+    def reset(self) -> None:
+        with self._lock:
+            self._events.clear()
+
+
+ACTIVITY_TRACKER = HourlyActivityTracker()
 
 
 @dataclass
@@ -952,6 +1012,8 @@ class QwenPersonActionPipeline:
                 if frame_idx % frame_interval != 0:
                     continue
 
+                ACTIVITY_TRACKER.record_event(stream_key, "processed")
+
                 # ======= 以下基本保持原来的检测 + Qwen 推理逻辑，只在最后增加 on_result 回调 =======
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_pil = Image.fromarray(frame_rgb)
@@ -965,7 +1027,9 @@ class QwenPersonActionPipeline:
                 if not detections:
                     prefs = UPLOAD_PREFS.snapshot()
                     if prefs.get("upload_all_frames", False):
-                        _upload_frame_to_minio(safe_id, frame_idx, msg_id, frame, False)
+                        obj_key = _upload_frame_to_minio(safe_id, frame_idx, msg_id, frame, False)
+                        if obj_key:
+                            ACTIVITY_TRACKER.record_event(stream_key, "minio")
                     if MONITORING_ENABLED:
                         ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
                         ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
@@ -1026,6 +1090,9 @@ class QwenPersonActionPipeline:
                             "future": future,
                         }
                     )
+
+                if person_jobs:
+                    ACTIVITY_TRACKER.record_event(stream_key, "vllm")
 
                 # 收集每个人的 Qwen 结果
                 detections_payload: List[Dict[str, Any]] = []
@@ -1153,13 +1220,15 @@ class QwenPersonActionPipeline:
                         if (upload_annotated and annotated is not None and has_detections)
                         else frame
                     )
-                    _upload_frame_to_minio(
+                    obj_key = _upload_frame_to_minio(
                         safe_id,
                         frame_idx,
                         msg_id,
                         target_image,
                         upload_annotated and has_detections,
                     )
+                    if obj_key:
+                        ACTIVITY_TRACKER.record_event(stream_key, "minio")
 
                 if need_video_frame and annotated is not None:
                     if writer is None:
@@ -1217,4 +1286,5 @@ __all__ = [
     "set_upload_all_frames",
     "set_upload_annotated",
     "get_upload_preferences",
+    "ACTIVITY_TRACKER",
 ]
