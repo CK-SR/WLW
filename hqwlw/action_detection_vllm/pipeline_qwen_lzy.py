@@ -10,6 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from collections import defaultdict, deque
 import asyncio
 import threading
+import queue
 
 
 import cv2
@@ -18,7 +19,7 @@ import torch
 from PIL import Image
 import redis
 from configs.settings import settings as config_settings
-from camera_check_fastapi.src.performance import PERFORMANCE_MONITOR
+
 # from transformers import (
 #     AutoModelForZeroShotObjectDetection,
 #     AutoProcessor,
@@ -52,6 +53,7 @@ from camera_check_fastapi.src.main import MinioManager, safe_filename
 
 
 DEFAULT_ACTION_CLASSES: Dict[int, str] = {
+    -1: "unknown",
     0: "smoking",
     1: "calling",
     2: "climb",
@@ -59,19 +61,54 @@ DEFAULT_ACTION_CLASSES: Dict[int, str] = {
     4: "run",
     5: "takephoto",
     6: "walk",
-    7: "carry",
+    7: "carry",   # 原 carry → theft
 }
+
+# === 新增：哪些行为视为“正常行为”，不会算异常 ===
+#NORMAL_CLASSES = {"walk", "walking"}  # walk / walking 都当作正常
+UNKNOWN_CLASSES = {"unknown"}
+
+# 其他一律算异常的话可以不用这个集合；如果想精确控制，可以改成：
+ABNORMAL_CLASSES = {
+    "walk",
+    "smoking",
+    "calling",
+    "climb",
+    "jump",
+    "run",
+    "takephoto",
+    "carry",
+}
+
+
+# 允许的 id-name 映射（用于一致性校验）
+VALID_ID_TO_NAME: Dict[int, str] = {
+    -1: "unknown",
+     0: "smoking",
+     1: "calling",
+     2: "climb",
+     3: "jump",
+     4: "run",
+     5: "takephoto",
+     6: "walk",
+     7: "carry",
+}
+VALID_NAME_TO_ID: Dict[str, int] = {v: k for k, v in VALID_ID_TO_NAME.items()}
+
+# === 异常告警的最小置信度阈值（宁可漏检）===
+ABNORMAL_MIN_CONFIDENCE = float(os.environ.get("ABNORMAL_MIN_CONFIDENCE", "0.8"))
 
 PRIMARY_MINIO_BUCKET = str(getattr(config_settings.minio, "bucket", "") or "")
 
 
 def _resolve_action_bucket() -> str:
-    bucket = getattr(config_settings.minio, "action_bucket", None)
-    if not bucket:
-        bucket = f"{PRIMARY_MINIO_BUCKET}-action" if PRIMARY_MINIO_BUCKET else "action-detection"
-    if bucket == PRIMARY_MINIO_BUCKET:
-        bucket = f"{bucket}-ad"
-    return bucket
+    # bucket = getattr(config_settings.minio, "action_bucket", None)
+    # if not bucket:
+    #     bucket = f"{PRIMARY_MINIO_BUCKET}-action" if PRIMARY_MINIO_BUCKET else "action-detection"
+    # if bucket == PRIMARY_MINIO_BUCKET:
+    #     bucket = f"{bucket}-ad"
+    # return bucket
+    return "action-detection-vllm"
 
 
 def _resolve_minio_lifecycle_days() -> int:
@@ -91,12 +128,14 @@ def _resolve_minio_lifecycle_days() -> int:
     return 3
 
 
-MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", False))
-MINIO_RING_SIZE = int(getattr(config_settings.minio, "max_frames_per_stream", 0))
+MINIO_RING_ENABLED = bool(getattr(config_settings.minio, "ring_enabled", True))
+MINIO_RING_SIZE = int(getattr(config_settings.minio, "max_frames_per_stream", 10000000))
 MINIO_JPEG_QUALITY = int(getattr(config_settings.minio, "jpeg_quality", 85))
 #DEFAULT_UPLOAD_ALL_FRAMES = str(getattr(config_settings.minio, "save_mode", "all")).lower() == "all"
 DEFAULT_UPLOAD_ALL_FRAMES = False
 
+# === 新增：冷静期（秒），默认 30s，环境变量可覆盖 ===
+DEFAULT_COOLDOWN_SECONDS = float(os.environ.get("PIPELINE_COOLDOWN_SECONDS", "3"))
 
 class UploadPreferences:
     def __init__(self) -> None:
@@ -137,6 +176,14 @@ def get_upload_preferences() -> Dict[str, bool]:
     return UPLOAD_PREFS.snapshot()
 
 
+def _draw_one_detection(frame_bgr: np.ndarray, bbox_xyxy: Tuple[int,int,int,int], label: str) -> np.ndarray:
+    img = frame_bgr.copy()
+    x1,y1,x2,y2 = bbox_xyxy
+    cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,0), 2)
+    cv2.putText(img, label, (x1, max(0, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+    return img
+
+
 def _parse_iso_to_epoch(ts: Optional[str]) -> Optional[float]:
     """Parse ISO-8601 or numeric timestamp string to epoch seconds."""
 
@@ -152,73 +199,45 @@ def _parse_iso_to_epoch(ts: Optional[str]) -> Optional[float]:
         return None
 
 
-MONITORING_ENABLED = bool(config_settings.monitoring.enabled)
-if MONITORING_ENABLED:
-    PERFORMANCE_MONITOR.configure(
-        history_size=int(config_settings.monitoring.history_size),
-        frame_history=int(config_settings.monitoring.frame_history),
-    )
-else:
-    PERFORMANCE_MONITOR.reset()
 
+class BenchmarkRecorder:
+    """
+    简单的 benchmark 记录器：
+    - record(stage, duration_ms): 记录某阶段一次耗时
+    - record_drop(stage): 记录丢弃事件（只统计次数）
+    - snapshot(): 返回 {stage: {count, avg_ms, max_ms}}
+    """
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stats: Dict[str, Dict[str, float]] = {}
 
-class HourlyActivityTracker:
-    """Track per-stream activity within a rolling time window."""
-
-    def __init__(self, window_seconds: int = 3600) -> None:
-        self._window_seconds = window_seconds
-        self._events = defaultdict(
-            lambda: {"processed": deque(), "vllm": deque(), "minio": deque()}
-        )
-        self._lock = threading.RLock()
-
-    def _trim(self, queue: deque, cutoff: float) -> None:
-        while queue and queue[0] < cutoff:
-            queue.popleft()
-
-    def record_event(self, stream: str, event: str) -> None:
-        if not stream:
+    def record(self, stage: str, duration_ms: Optional[float]) -> None:
+        if duration_ms is None:
             return
-        now = time.time()
-        cutoff = now - self._window_seconds
         with self._lock:
-            buckets = self._events[stream]
-            for key in ("processed", "vllm", "minio"):
-                buckets.setdefault(key, deque())
-            for bucket in buckets.values():
-                self._trim(bucket, cutoff)
-            if event in buckets:
-                buckets[event].append(now)
+            s = self._stats.setdefault(stage, {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
+            s["count"] += 1
+            s["total_ms"] += float(duration_ms)
+            s["max_ms"] = max(s["max_ms"], float(duration_ms))
 
-    def snapshot_last_hour(self) -> Dict[str, object]:
-        now = time.time()
-        cutoff = now - self._window_seconds
-        summary: Dict[str, Dict[str, int]] = {}
+    def record_drop(self, stage: str) -> None:
         with self._lock:
-            for stream, buckets in self._events.items():
-                for key in ("processed", "vllm", "minio"):
-                    buckets.setdefault(key, deque())
-                for bucket in buckets.values():
-                    self._trim(bucket, cutoff)
-                summary[stream] = {
-                    "frames_processed": len(buckets["processed"]),
-                    "vllm_frames": len(buckets["vllm"]),
-                    "minio_frames": len(buckets["minio"]),
+            s = self._stats.setdefault(stage, {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
+            s["count"] += 1
+
+    def snapshot(self) -> Dict[str, Dict[str, float]]:
+        with self._lock:
+            out: Dict[str, Dict[str, float]] = {}
+            for stage, s in self._stats.items():
+                cnt = s["count"]
+                avg = s["total_ms"] / cnt if cnt > 0 else 0.0
+                out[stage] = {
+                    "count": cnt,
+                    "avg_ms": avg,
+                    "max_ms": s["max_ms"],
                 }
-            active_streams = sum(1 for data in summary.values() if any(data.values()))
-            return {
-                "generated_at": datetime.utcnow().isoformat(),
-                "window_seconds": self._window_seconds,
-                "stream_count": active_streams,
-                "streams": summary,
-            }
+            return out
 
-    def reset(self) -> None:
-        with self._lock:
-            self._events.clear()
-
-
-ACTIVITY_TRACKER = HourlyActivityTracker()
 
 
 @dataclass
@@ -263,13 +282,8 @@ ACTION_MINIO_ACCESS_KEY = config_settings.minio.access_key
 ACTION_MINIO_SECRET_KEY = config_settings.minio.secret_key
 ACTION_MINIO_BUCKET = _resolve_action_bucket()
 ACTION_MINIO_SECURE = bool(config_settings.minio.secure)
-ACTION_MINIO_LIFECYCLE_DAYS = _resolve_minio_lifecycle_days()
+ACTION_MINIO_LIFECYCLE_DAYS = 0
 
-MINIO_MONITOR_CALLBACK: Callable[[str, str, float], None] | None = (
-    (lambda safe_id, stage, duration: PERFORMANCE_MONITOR.record_stage(safe_id, stage, duration))
-    if MONITORING_ENABLED
-    else None
-)
 
 
 class ActionMinioManager(MinioManager):
@@ -279,9 +293,80 @@ class ActionMinioManager(MinioManager):
         # 使用线程锁来维护环形索引，避免基类中的 asyncio.Lock 绑定到不同事件循环时
         # 引发 RuntimeError。
         import threading
+        import re
 
         self._ring_lock_sync = threading.Lock()
+        self._warmup_done = set()          # 记录哪些 safe_id 已 warmup，避免重复扫 MinIO
+        self._slot_re = re.compile(r"/ring/(\d{6})_")  # 支持 000123_raw.jpg / 000123_annotated.jpg
         super().__init__(*args, **kwargs)
+
+    async def warmup_ring_ptr_from_minio(self, safe_id: str, ring_size: int) -> None:
+        """
+        仅依赖 MinIO 扫描 {safe_id}/ring/ 下的对象，恢复“最后写入槽位”指针。
+        - 不依赖 Redis
+        - 以 last_modified 最新为准；若 last_modified 相同，使用 object_name 做 tie-breaker
+        - 扫不到则置 -1
+        """
+        if ring_size <= 0:
+            return
+        if not getattr(self, "_client", None):
+            # MinIO 未初始化
+            return
+
+        # 避免频繁扫描：每个 safe_id 仅 warmup 一次
+        with self._ring_lock_sync:
+            if safe_id in self._warmup_done:
+                return
+            # 先标记，避免并发重复扫（即使扫失败也不会无限扫；你也可以改成失败不标记）
+            self._warmup_done.add(safe_id)
+
+        prefix = f"{safe_id}/ring/"
+
+        def _list_all():
+            # list_objects 返回生成器
+            return list(self._client.list_objects(self.bucket, prefix=prefix, recursive=True))
+
+        try:
+            items = await self._run_in_executor(self._io_executor, _list_all)
+        except Exception as e:
+            print(f"[minio][warmup][warn] list_objects failed for {safe_id}: {e}")
+            with self._ring_lock_sync:
+                self._ring_ptr[safe_id] = -1
+            return
+
+        if not items:
+            with self._ring_lock_sync:
+                self._ring_ptr[safe_id] = -1
+            return
+
+        # last_modified 最新优先；相同时间用 object_name 做稳定排序
+        def _key(o):
+            lm = getattr(o, "last_modified", None)
+            # lm 可能是 datetime；None 兜底为 0
+            return (lm or 0, getattr(o, "object_name", ""))
+
+        latest = max(items, key=_key)
+        obj_name = getattr(latest, "object_name", "")
+
+        m = self._slot_re.search(obj_name)
+        if not m:
+            # 兜底：尝试匹配没有下划线的情况：.../ring/000123.jpg（如果你未来改名）
+            import re as _re
+            m2 = _re.search(r"/ring/(\d{6})", obj_name)
+            if not m2:
+                with self._ring_lock_sync:
+                    self._ring_ptr[safe_id] = -1
+                return
+            slot = int(m2.group(1))
+        else:
+            slot = int(m.group(1))
+
+        # 防御：slot 可能来自旧 ring_size（你改过 max_frames_per_stream），做一次取模
+        slot = int(slot) % int(ring_size)
+        with self._ring_lock_sync:
+            self._ring_ptr[safe_id] = slot
+        print(f"[minio][warmup] safe_id={safe_id} last_slot={slot} from={obj_name}")
+
 
     async def next_ring_slot(self, safe_id: str, ring_size: int) -> Optional[int]:
         """
@@ -292,12 +377,28 @@ class ActionMinioManager(MinioManager):
         """
         if ring_size <= 0:
             return None
+        
+        if not getattr(self,"_client", None):
+            try:
+                self.initialize()
+            except Exception as e:
+                print(f"[minio] [warmup] [warn] init failed : {e}")
+
+        
+        # ★ 新增：若首次出现该 safe_id，先用 MinIO 扫描 warmup 指针，避免重启后从 0 覆盖最新帧
+        if safe_id not in self._ring_ptr:
+            try:
+                await self.warmup_ring_ptr_from_minio(safe_id, ring_size)
+            except Exception as e:
+                print(f"[minio][warmup][warn] warmup failed for {safe_id}: {e}")
 
         with self._ring_lock_sync:
             current = self._ring_ptr.get(safe_id, -1)
-            next_index = (current + 1) % ring_size
+            next_index = (current + 1) % int(ring_size)
             self._ring_ptr[safe_id] = next_index
             return next_index
+
+
 
 
 MINIO_MANAGER = ActionMinioManager(
@@ -309,10 +410,9 @@ MINIO_MANAGER = ActionMinioManager(
     lifecycle_days=ACTION_MINIO_LIFECYCLE_DAYS,
     io_executor=EXECUTOR_IO,
     upload_executor=ACTION_MINIO_UPLOAD_EXECUTOR,
-    monitor_callback=MINIO_MONITOR_CALLBACK,
 )
 r = redis.Redis(
-    host="192.168.130.14",
+    host=config_settings.redis.host,
     port=6379,
     password=None,
     db=0,
@@ -348,13 +448,49 @@ async def get_one_frame(stream_key: str, timeout_sec: float = 1.0):
                     meta = json.loads(fields[b"meta"].decode("utf-8"))
                     jpeg = fields[b"jpeg"]
                     msg_id = _id.decode() if isinstance(_id, bytes) else str(_id)
-                    if MONITORING_ENABLED:
-                        PERFORMANCE_MONITOR.record_stage(stream_key, "redis_fetch", elapsed_ms)
                     return msg_id, meta, jpeg, elapsed_ms
         else:
             print(f"[redis] no frame for {stream_key}, retry...")
         await asyncio.sleep(0.01)
     return None, None, None, None
+
+def get_one_frame_sync(stream_key: str, timeout_sec: float = 1.0):
+    """
+    同步版本：从 Redis中读取一帧。
+    
+    返回: (msg_id, meta, jpeg_bytes, redis_fetch_ms)
+    若超时未读到帧，返回 (None, None, None, None)
+    """
+    # 处理一下双前缀问题：如果已经带 frames:，就去掉再交给 _read_one_from_redis
+    real_key = stream_key
+    if real_key.startswith("frames:"):
+        real_key = real_key[len("frames:") :]
+
+    deadline = time.time() + timeout_sec
+    start_monotonic = time.monotonic()
+    block_ms = int(timeout_sec * 1000)
+
+    while time.time() < deadline:
+        # _read_one_from_redis 会自己加一层 frames:
+        # → 实际读的是 key = "frames:{real_key}"
+        streams = _read_one_from_redis(real_key, block_ms)
+        if streams:
+            elapsed_ms = (time.monotonic() - start_monotonic) * 1000.0
+            print(f"[redis] got frame for {stream_key}")
+            for _stream, messages in streams:
+                for _id, fields in messages:
+                    meta = json.loads(fields[b"meta"].decode("utf-8"))
+                    jpeg = fields[b"jpeg"]
+                    msg_id = _id.decode() if isinstance(_id, bytes) else str(_id)
+                    return msg_id, meta, jpeg, elapsed_ms
+
+        print(f"[redis] no frame for {stream_key}, retry...")
+        time.sleep(0.01)
+
+    # 超时
+    return None, None, None, None
+
+
 
 def _load_class_names(data_config: Optional[str]) -> Dict[int, str]:
     if not data_config:
@@ -602,6 +738,34 @@ def _upload_frame_to_minio(
     return obj_key if etag else None
 
 
+def _build_minio_public_url(obj_key: Optional[str]) -> Optional[str]:
+    """
+    根据 MinIO 的 endpoint / bucket / secure 拼出一个可访问的 HTTP(S) URL。
+    例如：
+      endpoint = "4.1.9.10:9000"
+      bucket   = "pose-action"
+      obj_key  = "rtsp___192_168_130_14_8554_test2/ring/000191_annotated.jpg"
+
+    则返回：
+      "http://4.1.9.10:9000/pose-action/rtsp___192_168_130_14_8554_test2/ring/000191_annotated.jpg"
+    """
+    if not obj_key:
+        return None
+
+    # 1) 协议：根据 MinIO secure 判断 http / https
+    scheme = "https" if ACTION_MINIO_SECURE else "http"
+
+    # 2) endpoint 可能已经带了 http:// 或 https://，这里统一剥掉前缀
+    endpoint = ACTION_MINIO_ENDPOINT
+    if endpoint.startswith("http://"):
+        endpoint = endpoint[len("http://") :]
+    elif endpoint.startswith("https://"):
+        endpoint = endpoint[len("https://") :]
+
+    # 3) 拼接 URL：scheme://endpoint/bucket/obj_key
+    return f"{scheme}://{endpoint}/{ACTION_MINIO_BUCKET}/{obj_key}"
+
+
 def _upload_crop_to_minio(
     safe_id: str, frame_idx: int, person_id: int, msg_id: Optional[str], crop: np.ndarray
 ) -> Optional[str]:
@@ -683,13 +847,16 @@ class QwenPersonActionPipeline:
         #     grounding_model_id
         # ).to(self._device)
 
-        #self._grounding_model = YOLO("/workspace/models/yolo11n.pt").to(self._device)
-        self._grounding_model = YOLO("yolo11m.pt").to(self._device)
+        self._grounding_model = YOLO("/workspace/models/yolo11n.pt").to(self._device)
+        #self._grounding_model = YOLO("/workspace/yolo11m.pt").to(self._device)
 
         self._class_names = _load_class_names(data_config) or DEFAULT_ACTION_CLASSES
         self._class_name_to_id = {
             name.lower(): idx for idx, name in self._class_names.items()
         }
+        self._enable_yolo_warmup = str(os.environ.get("YOLO_WARMUP", "1")).lower() not in ("0", "false")
+        self._log_detect_stats = True
+        self._detect_stats_logged = False
 
         self._qwen_device = qwen_device or ("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if "cuda" in str(self._qwen_device) and torch.cuda.is_available() else torch.float32
@@ -721,10 +888,58 @@ class QwenPersonActionPipeline:
         # ==== 新增：每路流一个 stop_flag，用于 /stop 控制 ====
         self._stop_flags: Dict[str, bool] = {}
 
+        import queue  
+
+        self._benchmark = BenchmarkRecorder()
+
+        # 全局 crop 任务队列（生产端放 crop，消费端 vLLM Worker 消费）
+        self._crop_queue: "queue.Queue[Dict[str, Any]]" = queue.Queue(
+            maxsize=int(os.environ.get("CROP_QUEUE_SIZE", "2048"))
+        )
+        self._consumer_workers = int(os.environ.get("CROP_CONSUMER_WORKERS", "16"))
+        self._consumers_started = False
+        self._on_result_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+
+        # ==== 检测侧：队列 + worker 池 ====
+        self._detect_queue_size = int(os.environ.get("DETECT_QUEUE_SIZE", "20"))
+        self._detect_workers = int(os.environ.get("DETECT_WORKERS", "1"))
+        self._detect_batch_size = int(os.environ.get("DETECT_BATCH_SIZE", "64"))
+        self._detect_batch_wait_ms = float(os.environ.get("DETECT_BATCH_WAIT_MS", "1000"))
+        self._detect_workers_started = False
+        self._detect_queues: Dict[str, "queue.Queue[Dict[str, Any]]"] = {}
+        self._detect_queues_lock = threading.Lock()
+        self._detect_rr_index = 0
+
+        # === 新增：每路流的冷静期控制 ===
+        import threading as _threading_mod
+        self._cooldown_seconds: float = DEFAULT_COOLDOWN_SECONDS
+        # 记录每个 stream_key 的“冷静到期时间戳”（time.time() 的秒）
+        self._cooldown_until: Dict[str, float] = {}
+        self._cooldown_lock = _threading_mod.Lock()
+        
+        # === 异常类别最小置信度（再保险）：低于此阈值一律当 unknown 处理 ===
+        self._abnormal_min_conf = ABNORMAL_MIN_CONFIDENCE
+
+        if self._enable_yolo_warmup:
+            self._warmup_yolo()
+
 
 
     def _detect_with_grounding(self, frame_pil: Image.Image) -> List[GroundingResult]:
         results = self._grounding_model(frame_pil, conf=self._grounding_threshold, classes=[0])  # 0=COCO person
+        if self._log_detect_stats and not self._detect_stats_logged and results:
+            try:
+                r0 = results[0]
+                speed = getattr(r0, "speed", {}) or {}
+                print(
+                    f"[detect] device={self._grounding_model.device} input_shape={r0.orig_shape} "
+                    f"preprocess_ms={speed.get('preprocess', 'na')} "
+                    f"inference_ms={speed.get('inference', 'na')} "
+                    f"postprocess_ms={speed.get('postprocess', 'na')}"
+                )
+                self._detect_stats_logged = True
+            except Exception as e:
+                print(f"[detect] log stats failed: {e}")
         detections = []
         for r in results:
             for box in r.boxes:
@@ -732,6 +947,23 @@ class QwenPersonActionPipeline:
                 score = float(box.conf[0].cpu())
                 detections.append(GroundingResult(box_xyxy=(x1, y1, x2, y2), score=score, label="person"))
         return detections
+
+    def _warmup_yolo(self) -> None:
+        """Run a tiny forward pass so cold-start latency is paid at service startup."""
+        try:
+            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+            dummy_pil = Image.fromarray(dummy)
+            with torch.no_grad():
+                _ = self._grounding_model(
+                    dummy_pil,
+                    conf=self._grounding_threshold,
+                    classes=[0],
+                )
+                if torch.cuda.is_available() and "cuda" in str(self._device):
+                    torch.cuda.synchronize()
+            print("[warmup] YOLO grounding model warmed up.")
+        except Exception as e:
+            print(f"[warmup] YOLO grounding model warmup failed: {e}")
 
     def _build_messages(self, image: Image.Image) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []
@@ -758,6 +990,421 @@ class QwenPersonActionPipeline:
                 self._stop_flags[k] = True
         else:
             self._stop_flags[stream_key] = True
+
+
+
+    def _start_consumers_if_needed(self, on_result: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        """
+        确保 vLLM 消费端线程已启动。on_result 由 API 层传入，用于 WebSocket 推送。
+        """
+        # 每次最新的 on_result 覆盖旧的，方便重启
+        if on_result is not None:
+            self._on_result_callback = on_result
+
+        if self._consumers_started:
+            return
+
+        self._consumers_started = True
+        # 初始队列长度记录一次，方便观测启动阶段的 backlog
+        try:
+            self._benchmark.record("crop_queue_size", float(self._crop_queue.qsize()))
+        except Exception:
+            pass
+        for i in range(self._consumer_workers):
+            t = threading.Thread(
+                target=self._consumer_loop,
+                name=f"crop-consumer-{i}",
+                daemon=True,
+            )
+            t.start()
+
+    def _start_detect_workers_if_needed(self) -> None:
+        if self._detect_workers_started:
+            return
+        self._detect_workers_started = True
+        for i in range(self._detect_workers):
+            t = threading.Thread(
+                target=self._detect_worker_loop,
+                name=f"detect-worker-{i}",
+                daemon=True,
+            )
+            t.start()
+
+    def _consumer_loop(self) -> None:
+        """
+        vLLM 消费端：从 _crop_queue 取出 crop，调用 _classify_action_with_qwen，然后通过 on_result 推送。
+        """
+        import queue as _queue_mod
+
+
+        
+
+        prefs = get_upload_preferences()   # {"upload_all_frames":..., "upload_annotated":...}
+        upload_annotated = bool(prefs.get("upload_annotated", True))
+
+        print("=============================debug====================================即将进入循环")
+        while True:
+            try:
+                task = self._crop_queue.get(timeout=1.0)
+            except _queue_mod.Empty:
+                continue
+
+            now = time.perf_counter()
+            enqueue_ts = task.get("enqueue_ts", now)
+            flow_start_ts = task.get("flow_start_ts", enqueue_ts)
+            queue_wait_ms = (now - enqueue_ts) * 1000.0
+            flow_to_consume_ms = (now - flow_start_ts) * 1000.0
+            self._benchmark.record("vllm_queue_wait", queue_wait_ms)
+            self._benchmark.record("pipeline_to_consume", flow_to_consume_ms)
+            try:
+                self._benchmark.record("crop_queue_size", float(self._crop_queue.qsize()))
+            except Exception:
+                pass
+
+            crop = task["crop"]
+            qwen_action = self._classify_action_with_qwen(crop)
+
+            cls_id = qwen_action.class_id
+            cls_name_norm = (qwen_action.class_name or "").strip().lower()
+            conf = float(qwen_action.confidence or 0.0)
+
+            # === 0) 统计原始输出（可选） ===
+            try:
+                self._benchmark.record("raw_cls_conf", conf)
+            except Exception:
+                pass
+
+            # === 1) 无效标签 / 解析失败 → 直接丢弃 ===
+            if cls_id is None or cls_name_norm == "":
+                self._benchmark.record_drop("invalid_label_drop")
+                self._crop_queue.task_done()
+                continue
+
+            if cls_id not in VALID_ID_TO_NAME or cls_name_norm not in VALID_NAME_TO_ID:
+                self._benchmark.record_drop("invalid_label_drop")
+                self._crop_queue.task_done()
+                continue
+
+            # 再做一层一致性验证（理论上在 _classify_action_with_qwen 已经处理过，这里防御式）
+            if VALID_ID_TO_NAME.get(cls_id) != cls_name_norm:
+                self._benchmark.record_drop("id_name_mismatch_drop")
+                self._crop_queue.task_done()
+                continue
+
+            # === 2) unknown 一律丢弃 ===
+            if cls_id == -1 or cls_name_norm in UNKNOWN_CLASSES:
+                self._benchmark.record_drop("unknown_drop")
+                self._crop_queue.task_done()
+                continue
+
+            
+
+            # === 4) 不在异常集合里的 label 一律丢弃（防止未来 prompt 变化） ===
+            if cls_name_norm not in ABNORMAL_CLASSES:
+                self._benchmark.record_drop("non_abnormal_drop")
+                self._crop_queue.task_done()
+                continue
+
+            # === 5) 置信度过滤（宁可漏检，不可错检） ===
+            if conf < self._abnormal_min_conf:
+                self._benchmark.record_drop("low_confidence_drop")
+                self._crop_queue.task_done()
+                continue
+
+            # === 6) 冷静期逻辑（只对“已通过置信度过滤的异常”生效） ===
+            stream_key = task.get("stream_key", task.get("stream_url", ""))
+            now_wall = time.time()
+            in_cooldown = False
+
+            # 冷静期调整，如果是 "walk" 行为，冷静期加长
+            def _get_cooldown_for_class(cls_name: str) -> float:
+                cooldown = DEFAULT_COOLDOWN_SECONDS
+                if cls_name == "walk":
+                    cooldown *= 5  # 将 walk 行为的冷静期加长
+                return cooldown
+
+            with self._cooldown_lock:
+                # 判断是否是 "walk" 行为，设置冷静期
+                cooldown_period = _get_cooldown_for_class(cls_name_norm)
+                cooldown_until = self._cooldown_until.get(stream_key, 0.0)
+                if now_wall < cooldown_until:
+                    in_cooldown = True
+                else:
+                    # 当前不在冷静期，则允许这次事件通过，并立即刷新冷静期
+                    self._cooldown_until[stream_key] = now_wall + cooldown_period
+
+            if in_cooldown:
+                self._benchmark.record_drop("cooldown_drop")
+                self._crop_queue.task_done()
+                continue
+
+            # === 走到这里：说明已经是“高置信度异常 + 不在冷静期” → 可以进入上传 & WebSocket 阶段 ===
+
+            raw_frame = task["raw_frame"]
+            bbox = task["bbox_xyxy"]
+
+            label = f'{qwen_action.class_name or "unknown"} {qwen_action.confidence or 0:.2f}'
+            if upload_annotated:
+                upload_img = _draw_one_detection(raw_frame, bbox, label)
+                obj_key = _upload_frame_to_minio(task["safe_id"], task["frame_index"], task["msg_id"], upload_img, annotated=True)
+            else:
+                obj_key = _upload_frame_to_minio(task["safe_id"], task["frame_index"], task["msg_id"], raw_frame, annotated=False)
+            # ★ 新增：构造完整可访问的 URL
+            image_minio_url = _build_minio_public_url(obj_key)
+
+
+            flow_total_ms = (time.perf_counter() - flow_start_ts) * 1000.0
+            self._benchmark.record("pipeline_total", flow_total_ms)
+
+            # === benchmark：记录 vLLM 各阶段耗时 ===
+            self._benchmark.record("vllm_encode", qwen_action.timings.get("encode_ms"))
+            self._benchmark.record("vllm_build_msg", qwen_action.timings.get("build_msg_ms"))
+            self._benchmark.record("vllm_http", qwen_action.timings.get("http_ms"))
+            self._benchmark.record("vllm_parse", qwen_action.timings.get("parse_json_ms"))
+            self._benchmark.record("vllm_total", qwen_action.timings.get("total_ms"))
+
+            # === 构造 WebSocket payload（每个 crop 一条），附带原始帧 obj_key ===
+            if self._on_result_callback is not None:
+                bbox_xyxy_norm = task["bbox_xyxy_norm"]
+                payload = {
+                    "stream": task["stream_url"],
+                    "msg_id": task["msg_id"],
+                    "meta": task["meta"],
+                    "frame_obj_key": obj_key,
+                    "uploaded_annotated": upload_annotated,
+                    # ★ 新增：对齐文档要求的完整 URL
+                    "image_minio": image_minio_url,
+                    "detection": {
+                        "bbox_xyxy": bbox_xyxy_norm,
+                        "conf": qwen_action.confidence,
+                        "cls": qwen_action.class_name or "unknown",
+                        "rationale": qwen_action.rationale,
+                    },
+                    "latency": {
+                        "redis_fetch_ms": task.get("redis_fetch_ms"),
+                        "decode_ms": task.get("decode_ms"),
+                        "detection_ms": task.get("detection_ms"),
+                        "enqueue_wait_ms": queue_wait_ms,
+                        "flow_to_consume_ms": flow_to_consume_ms,
+                        "pipeline_total_ms": flow_total_ms,
+                        "vllm_encode_ms": qwen_action.timings.get("encode_ms"),
+                        "vllm_http_ms": qwen_action.timings.get("http_ms"),
+                        "vllm_parse_ms": qwen_action.timings.get("parse_json_ms"),
+                        "vllm_total_ms": qwen_action.timings.get("total_ms"),
+                    },
+                    "frame_index": task["frame_index"],
+                    "person_index": task["person_index"],
+                }
+                try:
+                    self._on_result_callback(payload)
+                except Exception as e:
+                    print(f"[consumer] on_result callback failed: {e}")
+
+            self._crop_queue.task_done()
+
+    def _enqueue_detect_task(self, task: Dict[str, Any]) -> None:
+        """入检测队列，队列满则丢最旧的任务以保持实时性。"""
+        stream_key = task.get("stream_key", "")
+        q = self._get_or_create_detect_queue(stream_key)
+        try:
+            q.put_nowait(task)
+        except queue.Full:
+            try:
+                _ = q.get_nowait()  # 丢最旧
+                self._benchmark.record_drop("detect_drop")
+            except Exception:
+                pass
+            try:
+                q.put_nowait(task)
+            except Exception:
+                return
+        self._record_detect_queue_size()
+
+    def _enqueue_crop_task(self, task: Dict[str, Any]) -> None:
+        try:
+            self._crop_queue.put_nowait(task)
+        except queue.Full:
+            try:
+                _ = self._crop_queue.get_nowait()   # 丢最旧
+                self._benchmark.record_drop("crop_drop_oldest")
+                #self._crop_queue.task_done()        # 可选：如果你在别处依赖 task_done 计数
+            except Exception:
+                pass
+            try:
+                self._crop_queue.put_nowait(task)
+            except Exception:
+                self._benchmark.record_drop("crop_drop_new")
+                return
+        try:
+            self._benchmark.record("crop_queue_size", float(self._crop_queue.qsize()))
+        except Exception:
+            pass
+
+
+    def _detect_worker_loop(self) -> None:
+        """检测 worker：批处理 YOLO，结果入 crop 队列。"""
+        import queue as _queue_mod
+
+        while True:
+            first = self._get_next_detect_task_blocking()
+            batch: List[Dict[str, Any]] = []
+            if first is None:
+                continue
+            batch.append(first)
+            batch_start = time.perf_counter()
+            while len(batch) < self._detect_batch_size:
+                remaining = self._detect_batch_wait_ms / 1000.0 - (time.perf_counter() - batch_start)
+                if remaining <= 0:
+                    break
+                nxt = self._get_next_detect_task_nonblocking()
+                if nxt is None:
+                    time.sleep(max(0.0, min(remaining, 0.005)))
+                    continue
+                batch.append(nxt)
+
+            images = []
+            for t in batch:
+                frame = t["frame"]
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                images.append(Image.fromarray(frame_rgb))
+
+            t_detect_start = time.perf_counter()
+            results = self._grounding_model(
+                images,
+                conf=self._grounding_threshold,
+                classes=[0],
+            )
+            t_detect_end = time.perf_counter()
+            detection_ms = (t_detect_end - t_detect_start) * 1000.0
+
+            for t, r in zip(batch, results):
+                stream_key = t["stream_key"]
+                frame_idx = t["frame_index"]
+                meta = t["meta"]
+                frame = t["frame"]
+                img_height, img_width = frame.shape[:2]
+
+                detections: List[GroundingResult] = []
+                for box in r.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().tolist()
+                    score = float(box.conf[0].cpu())
+                    detections.append(GroundingResult(box_xyxy=(x1, y1, x2, y2), score=score, label="person"))
+
+                self._benchmark.record("detection", detection_ms)
+
+                if detections:
+                    cx_frame, cy_frame = img_width / 2.0, img_height / 2.0
+
+                    def _center_dist(det: GroundingResult) -> float:
+                        x1, y1, x2, y2 = det.box_xyxy
+                        cx = 0.5 * (x1 + x2)
+                        cy = 0.5 * (y1 + y2)
+                        return (cx - cx_frame) ** 2 + (cy - cy_frame) ** 2
+
+                    detections = sorted(detections, key=_center_dist)[:5]
+
+                if not detections:
+                    continue
+
+                
+
+                for person_id, detection in enumerate(detections):
+                    x1, y1, x2, y2 = _expand_box(
+                        detection.box_xyxy, t["box_expand_ratio"], img_width, img_height
+                    )
+                    crop = frame[y1:y2, x1:x2].copy()
+                    crop, _, _ = _ensure_min_short_side(crop, t["crop_min_short_side"])
+
+                    bbox_xyxy_norm = [
+                        x1 / img_width,
+                        y1 / img_height,
+                        x2 / img_width,
+                        y2 / img_height,
+                    ]
+
+                    task = {
+                        "stream_key": stream_key,
+                        "stream_url": meta.get("stream", stream_key) if meta else stream_key,
+                        "safe_id": t["safe_id"],
+                        "frame_index": frame_idx,
+                        "person_index": person_id,
+                        "raw_frame": frame,
+                        "bbox_xyxy": (x1, y1, x2, y2),
+                        "bbox_xyxy_norm": bbox_xyxy_norm,
+                        "grounding_score": float(detection.score),
+                        "crop": crop,
+                        "msg_id": t["msg_id"],
+                        "meta": meta or {},
+                        #"raw_frame_obj_key": raw_frame_obj_key,
+                        "flow_start_ts": t.get("flow_start_ts", time.perf_counter()),
+                        "redis_fetch_ms": t.get("redis_fetch_ms"),
+                        "decode_ms": t.get("decode_ms"),
+                        "detection_ms": detection_ms,
+                        "enqueue_ts": time.perf_counter(),
+                    }
+
+                    self._enqueue_crop_task(task)
+
+
+            for _ in batch:
+                try:
+                    q = self._get_or_create_detect_queue(_.get("stream_key", ""))
+                    q.task_done()
+                except Exception:
+                    pass
+
+    def _get_or_create_detect_queue(self, stream_key: str) -> "queue.Queue[Dict[str, Any]]":
+        with self._detect_queues_lock:
+            q = self._detect_queues.get(stream_key)
+            if q is None:
+                q = queue.Queue(maxsize=self._detect_queue_size)
+                self._detect_queues[stream_key] = q
+            return q
+
+    def _record_detect_queue_size(self) -> None:
+        try:
+            with self._detect_queues_lock:
+                total = sum(q.qsize() for q in self._detect_queues.values())
+            self._benchmark.record("detect_queue_size", float(total))
+        except Exception:
+            pass
+
+    def _get_next_detect_task_blocking(self) -> Optional[Dict[str, Any]]:
+        deadline = time.perf_counter() + 1.0
+        while True:
+            task = self._get_next_detect_task_nonblocking()
+            if task is not None:
+                return task
+            if time.perf_counter() > deadline:
+                return None
+            time.sleep(0.005)
+
+    def _get_next_detect_task_nonblocking(self) -> Optional[Dict[str, Any]]:
+        with self._detect_queues_lock:
+            stream_keys = list(self._detect_queues.keys())
+            if not stream_keys:
+                return None
+            start_idx = self._detect_rr_index % len(stream_keys)
+
+        total = len(stream_keys)
+        for i in range(total):
+            sk = stream_keys[(start_idx + i) % total]
+            q = self._detect_queues.get(sk)
+            if q is None:
+                continue
+            try:
+                task = q.get_nowait()
+                self._record_detect_queue_size()
+                self._detect_rr_index = start_idx + i + 1
+                return task
+            except queue.Empty:
+                continue
+        return None
+
+    def benchmark_snapshot(self) -> Dict[str, Dict[str, float]]:
+        """给 API 层 / 脚本使用，返回当前运行期间各阶段的耗时统计。"""
+        return self._benchmark.snapshot()
+
 
     def _classify_action_with_qwen(self, crop: np.ndarray) -> QwenAction:
         # === (0) 总计时开始 ===
@@ -862,6 +1509,47 @@ class QwenPersonActionPipeline:
 
         if isinstance(parsed.get("rationale"), str):
             rationale = parsed["rationale"].strip()
+            
+        # === (5.5) 代码级安全兜底：强制校验 id/name 一致性 & 合法性 ===
+        cls_id = class_id
+        cls_name = (class_name or "").strip().lower()
+
+        # 1) 先把名称归一到合法集合
+        if cls_name in VALID_NAME_TO_ID:
+            # 如果 name 合法但 id 缺失/不一致，用 name 反推 id
+            mapped_id = VALID_NAME_TO_ID[cls_name]
+            if cls_id is None or cls_id != mapped_id:
+                cls_id = mapped_id
+        elif cls_id in VALID_ID_TO_NAME:
+            # 如果 id 合法但 name 非法，用 id 反推 name
+            cls_name = VALID_ID_TO_NAME[cls_id]
+        else:
+            # 两个都不在合法集合里 → 强制 unknown
+            cls_id = -1
+            cls_name = "unknown"
+
+        # 2) 再做一轮最终合法性检查
+        if cls_id not in VALID_ID_TO_NAME or cls_name not in VALID_NAME_TO_ID:
+            cls_id = -1
+            cls_name = "unknown"
+
+        # 3) 置信度兜底
+        if confidence is None:
+            confidence = 0.2
+        try:
+            confidence = float(confidence)
+        except Exception:
+            confidence = 0.2
+
+        # 约束到 [0,1] 之间
+        confidence = max(0.0, min(1.0, confidence))
+
+        # unknown 的时候强制把置信度压到 0.2，表示“不确定”
+        if cls_id == -1 or cls_name in UNKNOWN_CLASSES:
+            confidence = 0.2
+
+        class_id = cls_id
+        class_name = cls_name
 
         t_end = time.perf_counter()
         total_ms = (t_end - t_start) * 1000.0
@@ -893,6 +1581,12 @@ class QwenPersonActionPipeline:
             f"jpeg={jpeg_bytes/1024:.1f}KB"
         )
 
+        self._benchmark.record("vllm_encode", encode_ms)
+        self._benchmark.record("vllm_build_msg", build_msg_ms)
+        self._benchmark.record("vllm_http", http_ms)
+        self._benchmark.record("vllm_parse", parse_json_ms)
+        self._benchmark.record("vllm_total", total_ms)
+
         return QwenAction(
             class_id=class_id,
             class_name=class_name,
@@ -920,6 +1614,13 @@ class QwenPersonActionPipeline:
         timeout_sec: float = 1.0,            # 每次从 redis 等待一帧的超时时间
         on_result: Optional[callable] = None,  # 新增：每帧检测结果的回调，用于 WebSocket 推送
     ) -> List[PersonActionResult]:
+
+        # 启动 vLLM 消费端线程，并把 on_result 传下去
+        self._start_consumers_if_needed(on_result)
+        # 启动检测 worker 池
+        self._start_detect_workers_if_needed()
+
+
         """
         从 Redis 中的帧流（frames:{stream_name}）读取视频帧进行处理。
         """
@@ -960,49 +1661,22 @@ class QwenPersonActionPipeline:
                     print(f"[stream {stream_key}] reached max_frames={max_frames}, stop.")
                     break
 
-                # === 使用新版 get_one_frame，从 Redis 读一帧 ===
+                # === 3. 从 Redis 同步读一帧（使用新的 get_one_frame_sync） ===
                 fetch_start = time.perf_counter()
-                msg_id, meta, jpeg, redis_fetch_ms = asyncio.run(
-                    get_one_frame(stream_key, timeout_sec=timeout_sec)
+                msg_id, meta, jpeg, redis_fetch_ms = get_one_frame_sync(
+                    stream_key, timeout_sec=timeout_sec
                 )
                 fetch_end = time.perf_counter()
-                if redis_fetch_ms is None:
-                    redis_fetch_ms = (fetch_end - fetch_start) * 1000.0
-                if jpeg is None:
-                    print(f"[stream {stream_key}] timeout {timeout_sec}s, no frame, stop.")
-                    break
-
-                decode_start = time.perf_counter()
-
-                np_buf = np.frombuffer(jpeg, dtype=np.uint8)
-                frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
-                decode_end = time.perf_counter()
-                decode_ms = (decode_end - decode_start) * 1000.0
-                if frame is None:
-                    print(f"[stream {stream_key}] decode failed, skip this frame.")
-                    if MONITORING_ENABLED:
-                        ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
-                        ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
-                        ts3_epoch = time.time()
-                        cap_ms = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
-                        queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
-                        e2e_ms = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
-                        PERFORMANCE_MONITOR.record_frame(
-                            stream_key,
-                            {
-                                "capture": cap_ms,
-                                "queue": queue_ms,
-                                "redis_fetch": redis_fetch_ms,
-                                "decode": decode_ms,
-                                "detection": None,
-                                "vllm_batch": None,
-                                "processing": None,
-                                "end_to_end": e2e_ms,
-                            },
-                            msg_id=msg_id,
-                            frame_index=frame_idx,
-                            persons=0,
-                        )
+                # 如果 get_one_frame_sync 没给出耗时，就这里兜底算一次（只在成功拿到帧时有意义）
+                if jpeg is not None:
+                    if redis_fetch_ms is None:
+                        redis_fetch_ms = (fetch_end - fetch_start) * 1000.0
+                    # 只在有帧时记录 redis_fetch
+                    if redis_fetch_ms is not None:
+                        self._benchmark.record("redis_fetch", redis_fetch_ms)
+                else:
+                    # 超时未拿到帧，直接下一轮
+                    print(f"[stream {stream_key}] timeout {timeout_sec}s, no frame.")
                     continue
 
                 frame_idx += 1
@@ -1012,262 +1686,36 @@ class QwenPersonActionPipeline:
                 if frame_idx % frame_interval != 0:
                     continue
 
-                ACTIVITY_TRACKER.record_event(stream_key, "processed")
+                decode_start = time.perf_counter()
 
-                # ======= 以下基本保持原来的检测 + Qwen 推理逻辑，只在最后增加 on_result 回调 =======
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_pil = Image.fromarray(frame_rgb)
-                img_width, img_height = frame_pil.size
-
-                t_detect_start = time.perf_counter()
-                detections = self._detect_with_grounding(frame_pil)
-                t_detect_end = time.perf_counter()
-                detection_ms = (t_detect_end - t_detect_start) * 1000.0
-                print(f"[stream {stream_key}] Frame {frame_idx}: Detected {len(detections)} persons")
-                if not detections:
-                    prefs = UPLOAD_PREFS.snapshot()
-                    if prefs.get("upload_all_frames", False):
-                        obj_key = _upload_frame_to_minio(safe_id, frame_idx, msg_id, frame, False)
-                        if obj_key:
-                            ACTIVITY_TRACKER.record_event(stream_key, "minio")
-                    if MONITORING_ENABLED:
-                        ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
-                        ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
-                        ts3_epoch = time.time()
-                        cap_ms = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
-                        queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
-                        processing_ms = (t_detect_end - decode_start) * 1000.0
-                        e2e_ms = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
-                        PERFORMANCE_MONITOR.record_frame(
-                            stream_key,
-                            {
-                                "capture": cap_ms,
-                                "queue": queue_ms,
-                                "redis_fetch": redis_fetch_ms,
-                                "decode": decode_ms,
-                                "detection": detection_ms,
-                                "vllm_batch": None,
-                                "processing": processing_ms,
-                                "end_to_end": e2e_ms,
-                            },
-                            msg_id=msg_id,
-                            frame_index=frame_idx,
-                            persons=0,
-                        )
+                np_buf = np.frombuffer(jpeg, dtype=np.uint8)
+                frame = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+                decode_end = time.perf_counter()
+                decode_ms = (decode_end - decode_start) * 1000.0
+                self._benchmark.record("decode", decode_ms)
+                if frame is None:
+                    print(f"[stream {stream_key}] decode failed, skip this frame.")
+                    
+                        
                     continue
 
-                per_frame_results: List[Dict[str, Any]] = []
-                person_jobs: List[Dict[str, Any]] = []
-                qwen_http_times: List[float] = []
-                qwen_total_times: List[float] = []
-                qwen_parse_times: List[float] = []
 
-                t_batch_start = time.perf_counter()
 
-                for person_id, detection in enumerate(detections):
-                    x1, y1, x2, y2 = _expand_box(
-                        detection.box_xyxy, box_expand_ratio, img_width, img_height
-                    )
-                    crop = frame[y1:y2, x1:x2].copy()
-                    crop, _, _ = _ensure_min_short_side(crop, crop_min_short_side)
 
-                    crop_path = None
-                    if save_crops:
-                        crop_path = _upload_crop_to_minio(
-                            safe_id, frame_idx, person_id, msg_id, crop
-                        )
-
-                    future = self._vllm_executor.submit(
-                        self._classify_action_with_qwen, crop
-                    )
-
-                    person_jobs.append(
-                        {
-                            "person_id": person_id,
-                            "detection": detection,
-                            "box": (x1, y1, x2, y2),
-                            "crop_path": crop_path,
-                            "future": future,
-                        }
-                    )
-
-                if person_jobs:
-                    ACTIVITY_TRACKER.record_event(stream_key, "vllm")
-
-                # 收集每个人的 Qwen 结果
-                detections_payload: List[Dict[str, Any]] = []
-
-                for job in person_jobs:
-                    person_id = job["person_id"]
-                    detection = job["detection"]
-                    x1, y1, x2, y2 = job["box"]
-                    crop_path = job["crop_path"]
-                    future = job["future"]
-
-                    qwen_action: QwenAction = future.result()
-
-                    if qwen_action.timings.get("http_ms") is not None:
-                        qwen_http_times.append(float(qwen_action.timings["http_ms"]))
-                    if qwen_action.timings.get("total_ms") is not None:
-                        qwen_total_times.append(float(qwen_action.timings["total_ms"]))
-                    if qwen_action.timings.get("parse_json_ms") is not None:
-                        qwen_parse_times.append(float(qwen_action.timings["parse_json_ms"]))
-
-                    per_frame_results.append(
-                        {
-                            "expanded_box": (x1, y1, x2, y2),
-                            "preds": [
-                                {
-                                    "class_name": qwen_action.class_name,
-                                    "confidence": qwen_action.confidence,
-                                    "rationale": qwen_action.rationale,
-                                }
-                            ],
-                        }
-                    )
-
-                    results.append(
-                        PersonActionResult(
-                            frame_index=frame_idx,
-                            person_index=person_id,
-                            box_xyxy=(x1, y1, x2, y2),
-                            grounding_score=detection.score,
-                            crop_path=crop_path,
-                            qwen_action=qwen_action,
-                        )
-                    )
-
-                    # === 组装 detections 里的一条记录（注意要归一化到 0-1） ===
-                    bbox_xyxy_norm = [
-                        x1 / img_width,
-                        y1 / img_height,
-                        x2 / img_width,
-                        y2 / img_height,
-                    ]
-                    detections_payload.append(
-                        {
-                            "bbox_xyxy": bbox_xyxy_norm,
-                            "conf": qwen_action.confidence if qwen_action.confidence is not None else float(detection.score),
-                            "cls": qwen_action.class_name or "unknown",
-                        }
-                    )
-
-                t_batch_end = time.perf_counter()
-                batch_ms = (t_batch_end - t_batch_start) * 1000.0
-                qwen_http_ms = max(qwen_http_times) if qwen_http_times else None
-                qwen_total_ms = max(qwen_total_times) if qwen_total_times else None
-                qwen_parse_ms = max(qwen_parse_times) if qwen_parse_times else None
-                print(
-                    f"[stream {stream_key}] vLLM batch for {len(person_jobs)} persons "
-                    f"took {batch_ms:.2f} ms (workers={self._vllm_workers})"
-                )
-
-                # === 如果有 on_result 回调，就按接口文档格式组装一份消息 ===
-                if on_result is not None and detections_payload:
-                    try:
-                        stream_url = meta.get("stream", stream_key)
-                        payload = {
-                            "stream": stream_url,
-                            "msg_id": msg_id,
-                            "meta": meta,
-                            "detections": detections_payload,
-                            "latency": {
-                                # 这里只把我们掌握的一点信息塞进去，其它字段可按需扩展
-                                "infer_ms": qwen_http_ms or 0.0,
-                                "post_ms": qwen_parse_ms or 0.0,
-                            },
-                        }
-                        on_result(payload)
-                    except Exception as e:
-                        print(f"[stream {stream_key}] on_result callback failed: {e}")
-
-                has_detections = bool(per_frame_results)
-                prefs = UPLOAD_PREFS.snapshot()
-                upload_all_frames = prefs.get("upload_all_frames", False)
-                upload_annotated = prefs.get("upload_annotated", True)
-                should_upload_frame = upload_all_frames or has_detections
-                need_video_frame = save_root is not None and save_video
-                need_annotated_image = (upload_annotated and should_upload_frame) or need_video_frame
-
-                annotated = None
-                if need_annotated_image:
-                    annotated = frame.copy()
-                    if has_detections:
-                        for person_data in per_frame_results:
-                            x1, y1, x2, y2 = person_data["expanded_box"]
-                            cv2.rectangle(annotated, (x1, y1), (x2, y2), (80, 200, 80), 2)
-                            preds = person_data.get("preds", [])
-                            for rank, pred in enumerate(preds[:top_k]):
-                                label_text = pred.get("class_name") or "unknown"
-                                conf = pred.get("confidence")
-                                if conf is not None:
-                                    label_text += f" {conf * 100:.1f}%"
-                                y_anchor = max(15, y1 - 10 - rank * 18)
-                                cv2.putText(
-                                    annotated,
-                                    label_text,
-                                    (x1, y_anchor),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5,
-                                    (50, 220, 50),
-                                    2,
-                                    lineType=cv2.LINE_AA,
-                                )
-
-                if should_upload_frame:
-                    target_image = (
-                        annotated
-                        if (upload_annotated and annotated is not None and has_detections)
-                        else frame
-                    )
-                    obj_key = _upload_frame_to_minio(
-                        safe_id,
-                        frame_idx,
-                        msg_id,
-                        target_image,
-                        upload_annotated and has_detections,
-                    )
-                    if obj_key:
-                        ACTIVITY_TRACKER.record_event(stream_key, "minio")
-
-                if need_video_frame and annotated is not None:
-                    if writer is None:
-                        if save_root is not None:
-                            video_output_path = (save_root / annotated_video_name).with_suffix(".mp4")
-                            video_output_path.parent.mkdir(parents=True, exist_ok=True)
-                        frame_size = (annotated.shape[1], annotated.shape[0])
-                        writer = _create_video_writer(video_output_path, fps, frame_size)
-                    writer.write(annotated)
-
-                processing_end = time.perf_counter()
-                processing_ms = (processing_end - decode_start) * 1000.0
-
-                if MONITORING_ENABLED:
-                    ts1_epoch = _parse_iso_to_epoch(meta.get("ts1")) if meta else None
-                    ts2_epoch = _parse_iso_to_epoch(meta.get("ts2")) if meta else None
-                    ts3_epoch = time.time()
-                    cap_ms = (ts2_epoch - ts1_epoch) * 1000.0 if (ts1_epoch and ts2_epoch) else None
-                    queue_ms = (ts3_epoch - ts2_epoch) * 1000.0 if ts2_epoch else None
-                    e2e_ms = (time.time() - ts1_epoch) * 1000.0 if ts1_epoch else None
-                    PERFORMANCE_MONITOR.record_frame(
-                        stream_key,
-                        {
-                            "capture": cap_ms,
-                            "queue": queue_ms,
-                            "redis_fetch": redis_fetch_ms,
-                            "decode": decode_ms,
-                            "detection": detection_ms,
-                            "vllm_batch": batch_ms,
-                            "vllm_http": qwen_http_ms,
-                            "vllm_parse": qwen_parse_ms,
-                            "vllm_total": qwen_total_ms,
-                            "processing": processing_ms,
-                            "end_to_end": e2e_ms,
-                        },
-                        msg_id=msg_id,
-                        frame_index=frame_idx,
-                        persons=len(person_jobs),
-                    )
+                detect_task = {
+                    "stream_key": stream_key,
+                    "safe_id": safe_id,
+                    "frame_index": frame_idx,
+                    "msg_id": msg_id,
+                    "meta": meta or {},
+                    "frame": frame,
+                    "box_expand_ratio": box_expand_ratio,
+                    "crop_min_short_side": crop_min_short_side,
+                    "flow_start_ts": fetch_start,
+                    "redis_fetch_ms": redis_fetch_ms,
+                    "decode_ms": decode_ms,
+                }
+                self._enqueue_detect_task(detect_task)
 
         finally:
             if writer is not None:
