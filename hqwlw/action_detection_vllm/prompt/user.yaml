@@ -1,7 +1,7 @@
 # user.yaml
 role: user
 content: |
-  Verify the primary person in this single YOLO-cropped image.
-  Only detect smoking or takephoto.
-  If direct visual evidence is insufficient, return unknown.
+  Verify the primary person in this single YOLO crop.
+  Only output: unknown / smoking / takephoto.
+  If the person is far, tiny, blurry, or action evidence is not direct, return unknown.
   Output ONLY the required minified JSON.

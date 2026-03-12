@@ -559,6 +559,7 @@ def _expand_box(
 def _ensure_min_short_side(
     crop: np.ndarray,
     target_short_side: int,
+    max_upscale_factor: float = 2.0,
 ) -> Tuple[np.ndarray, float, float]:
     height, width = crop.shape[:2]
     if height == 0 or width == 0:
@@ -568,7 +569,11 @@ def _ensure_min_short_side(
     if short_side >= target_short_side:
         return crop, 1.0, 1.0
 
-    scale = target_short_side / short_side
+    raw_scale = target_short_side / short_side
+    scale = min(raw_scale, max(1.0, float(max_upscale_factor)))
+    if scale <= 1.0:
+        return crop, 1.0, 1.0
+
     new_width = max(1, int(round(width * scale)))
     new_height = max(1, int(round(height * scale)))
     resized = cv2.resize(crop, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
@@ -857,6 +862,9 @@ class QwenPersonActionPipeline:
         self._enable_yolo_warmup = str(os.environ.get("YOLO_WARMUP", "1")).lower() not in ("0", "false")
         self._log_detect_stats = True
         self._detect_stats_logged = False
+        self._min_orig_short_side = int(os.environ.get("MIN_ORIG_SHORT_SIDE", "96"))
+        self._min_blur_var = float(os.environ.get("MIN_CROP_BLUR_VAR", "25.0"))
+        self._max_crop_upscale_factor = float(os.environ.get("MAX_CROP_UPSCALE_FACTOR", "2.0"))
 
         self._qwen_device = qwen_device or ("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if "cuda" in str(self._qwen_device) and torch.cuda.is_available() else torch.float32
@@ -1313,7 +1321,7 @@ class QwenPersonActionPipeline:
                         detection.box_xyxy, t["box_expand_ratio"], img_width, img_height
                     )
                     crop = frame[y1:y2, x1:x2].copy()
-                    crop, _, _ = _ensure_min_short_side(crop, t["crop_min_short_side"])
+                    # 保持原始 crop 尺寸，不做最短边上采样
 
                     bbox_xyxy_norm = [
                         x1 / img_width,
@@ -1409,6 +1417,48 @@ class QwenPersonActionPipeline:
     def _classify_action_with_qwen(self, crop: np.ndarray) -> QwenAction:
         # === (0) 总计时开始 ===
         t_start = time.perf_counter()
+
+        # === (0.5) 质量门控：远处小目标 / 严重模糊直接 unknown，避免上采样“脑补” ===
+        h, w = crop.shape[:2]
+        short_side = min(h, w) if h > 0 and w > 0 else 0
+        blur_var = 0.0
+        if h > 0 and w > 0:
+            try:
+                gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+                blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+            except Exception:
+                blur_var = 0.0
+
+        if short_side < self._min_orig_short_side or blur_var < self._min_blur_var:
+            t_end = time.perf_counter()
+            total_ms = (t_end - t_start) * 1000.0
+            rationale = "target too small or blurry"
+            return QwenAction(
+                class_id=-1,
+                class_name="unknown",
+                confidence=0.2,
+                rationale=rationale,
+                raw_response=json.dumps({
+                    "class_id": -1,
+                    "class_name": "unknown",
+                    "confidence": 0.2,
+                    "rationale": rationale,
+                }, ensure_ascii=False),
+                timings={
+                    "encode_ms": 0.0,
+                    "build_msg_ms": 0.0,
+                    "http_ms": 0.0,
+                    "parse_json_ms": 0.0,
+                    "total_ms": total_ms,
+                    "quality_gate_hit": 1.0,
+                },
+                meta={
+                    "jpeg_bytes": 0,
+                    "crop_wh": (w, h),
+                    "blur_var": blur_var,
+                    "short_side": short_side,
+                },
+            )
 
         # === (1) BGR -> data:URL（vLLM 接收 image_url），记录编码耗时 & 体积 ===
         data_url, encode_ms, jpeg_bytes = _img_ndarray_to_data_url(
