@@ -135,7 +135,7 @@ MINIO_JPEG_QUALITY = int(getattr(config_settings.minio, "jpeg_quality", 85))
 DEFAULT_UPLOAD_ALL_FRAMES = False
 
 # === 新增：冷静期（秒），默认 30s，环境变量可覆盖 ===
-DEFAULT_COOLDOWN_SECONDS = float(os.environ.get("PIPELINE_COOLDOWN_SECONDS", "3"))
+DEFAULT_COOLDOWN_SECONDS = float(os.environ.get("PIPELINE_COOLDOWN_SECONDS", "0"))
 
 class UploadPreferences:
     def __init__(self) -> None:
