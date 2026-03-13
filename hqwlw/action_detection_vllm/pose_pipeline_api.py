@@ -122,6 +122,7 @@ class PosePipelineManager:
                 annotated_video_name="annotated_qwen",
                 max_frames=None,           # 一直跑，直到 /stop
                 timeout_sec=1.0,
+                read_interval_sec=1.0,
                 on_result=emit,
             )
         finally:

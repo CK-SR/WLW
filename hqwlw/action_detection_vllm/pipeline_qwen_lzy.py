@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 import time
-from pathlib import Path
+from pathlib import Pathtimeout_sec: float = 1.0
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from collections import defaultdict, deque
 import asyncio
@@ -1612,6 +1612,7 @@ class QwenPersonActionPipeline:
         annotated_video_name: str = "annotated",
         max_frames: Optional[int] = None,    # 最多处理多少帧，为 None 就一直跑
         timeout_sec: float = 1.0,            # 每次从 redis 等待一帧的超时时间
+        read_interval_sec: Optional[float] = None,
         on_result: Optional[callable] = None,  # 新增：每帧检测结果的回调，用于 WebSocket 推送
     ) -> List[PersonActionResult]:
 
@@ -1637,6 +1638,12 @@ class QwenPersonActionPipeline:
         results: List[PersonActionResult] = []
         frame_idx = 0
         top_k = max(1, int(top_k))
+        read_interval = (
+            float(read_interval_sec)
+            if read_interval_sec is not None and float(read_interval_sec) > 0
+            else None
+        )
+        next_read_ts = 0.0
 
         # 没有总帧数，所以 tqdm 用 total=None
         progress = None
@@ -1656,6 +1663,14 @@ class QwenPersonActionPipeline:
                 if self._stop_flags.get(stream_key, False):
                     print(f"[stream {stream_key}] received stop signal, stop.")
                     break
+
+                # === 读取节流：限制每路流读取频率，避免一次读取过多帧 ===
+                if read_interval is not None:
+                    now_mono = time.monotonic()
+                    if now_mono < next_read_ts:
+                        time.sleep(min(next_read_ts - now_mono, 0.05))
+                        continue
+                    next_read_ts = now_mono + read_interval
 
                 if max_frames is not None and frame_idx >= max_frames:
                     print(f"[stream {stream_key}] reached max_frames={max_frames}, stop.")
