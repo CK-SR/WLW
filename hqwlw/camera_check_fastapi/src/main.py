@@ -30,6 +30,11 @@ from minio import Minio
 from minio.error import S3Error
 
 try:
+    from minio.commonconfig import CopySource  # ← 新增：copy_object 需要
+except Exception:
+    CopySource = None
+
+try:
     from minio.lifecycleconfig import Expiration, Filter, LifecycleConfig, Rule
 except ImportError:  # pragma: no cover - 兼容旧版 SDK
     Expiration = Filter = LifecycleConfig = Rule = None  # type: ignore
@@ -72,6 +77,8 @@ else:
     PERFORMANCE_MONITOR.reset()
 
 # 默认参数
+
+
 CURRENT_THRESHOLD = settings.DEFAULT_CURRENT_THRESHOLD
 EDGE_PARAMS = settings.DEFAULT_EDGE_PARAMS.copy()
 TAMPER_PARAMS = {
@@ -79,6 +86,9 @@ TAMPER_PARAMS = {
     "roi_diff_threshold": 8.0,     # ROI 小范围均值阈值
     "high_ratio": 0.15,            # 高差异像素比例阈值
 }
+
+# 正在做缩环迁移的流；迁移期间该流的帧“可分析但不上传 MinIO”
+MINIO_MIGRATING: Set[str] = set()
 
 
 class StreamState(str, Enum):
@@ -134,6 +144,8 @@ PREV_FRAMES: Dict[str, np.ndarray] = {}
 # 服务是否处于激活状态
 SERVICE_ACTIVE: bool = False
 
+SERVICE_RESTARTED = True  # 初始化标志，默认认为服务重启
+
 # ★ 测试模式配置
 TEST_MODE = os.getenv("ENABLE_TEST_VIDEO", "0") == "1"
 TEST_VIDEO_FPS = float(os.getenv("TEST_VIDEO_FPS", "20"))
@@ -158,6 +170,28 @@ MINIO_SAVE_MODE = config_settings.minio.save_mode
 
 WS_SEND_MODE = config_settings.stream.ws_send_mode  # all / abnormal
 
+# === per-stream 配置与冷静期 ===
+from typing import DefaultDict
+
+# 每路自定义最大帧数上限；未设置则回退到 MINIO_MAX_FRAMES_PER_STREAM
+PER_STREAM_MAX_FRAMES: Dict[str, int] = {}
+
+# 每路冷静期（秒）；未设置则为 0
+PER_STREAM_COOLDOWN: Dict[str, int] = {}
+
+# 记录每路“最近一次检测到异常”的时间戳（epoch 秒）
+LAST_INTRUSION_TS: Dict[str, float] = {}
+
+# 当订阅把 minio_storage_per_stream 调小后，标记该流需要做一次“老对象裁剪”
+STREAMS_NEED_TRIM: Set[str] = set()
+
+
+def get_max_frames(stream_name: str) -> int:
+    return int(PER_STREAM_MAX_FRAMES.get(stream_name, MINIO_MAX_FRAMES_PER_STREAM))
+
+def get_cooldown_seconds(stream_name: str) -> int:
+    return int(PER_STREAM_COOLDOWN.get(stream_name, 0))
+
 def _resolve_minio_lifecycle_days() -> int:
     if hasattr(config_settings.minio, "lifecycle_days"):
         value = getattr(config_settings.minio, "lifecycle_days")
@@ -176,6 +210,15 @@ def _resolve_minio_lifecycle_days() -> int:
 
 
 MINIO_LIFECYCLE_DAYS = _resolve_minio_lifecycle_days()
+
+# 获取当前MinIO的对象数量来决定是否缩环
+async def get_current_minio_capacity(safe_id: str) -> int:
+    try:
+        count = await MINIO_MANAGER.ring_object_count(safe_id)
+        return count
+    except Exception as e:
+        print(f"[minio][error] failed to get object count for {safe_id}: {e}")
+        return 0  # 如果失败则认为容量为0
 
 
 async def run_in_executor(executor: concurrent.futures.Executor, func: Callable, *args, **kwargs):
@@ -232,12 +275,18 @@ class MinioManager:
             self._client = client
             print(f"[minio] ready -> {self.endpoint} bucket={self.bucket}")
             self._apply_lifecycle_policy()
+            # ★★★ 新增：确保公共读取策略
+            self._ensure_public_read()
         except Exception as e:
             self._client = None
             print(f"[minio][error] init failed: {e}")
 
     def _apply_lifecycle_policy(self) -> None:
-        if not self._client or self.lifecycle_days <= 0:
+        if not self._client:
+            return
+
+        if self.lifecycle_days <= 0:
+            self._clear_lifecycle_policy()
             return
 
         days = int(self.lifecycle_days)
@@ -279,7 +328,139 @@ class MinioManager:
             except Exception as e_xml:
                 print(f"[minio][warn] set lifecycle failed: {e_obj} | xml_fallback_error: {e_xml}")
 
+    def _clear_lifecycle_policy(self) -> None:
+        """Remove bucket lifecycle configuration when lifecycle_days <= 0."""
 
+        if not self._client:
+            return
+
+        # 1) SDK API 优先
+        try:
+            self._client.delete_bucket_lifecycle(self.bucket)
+            print("[minio] lifecycle disabled: existing lifecycle policy removed")
+            return
+        except Exception as e_delete:
+            # 2) 兼容旧版本/不同命名实现
+            remove_fn = getattr(self._client, "remove_bucket_lifecycle", None)
+            if callable(remove_fn):
+                try:
+                    remove_fn(self.bucket)
+                    print("[minio] lifecycle disabled: existing lifecycle policy removed")
+                    return
+                except Exception as e_remove:
+                    print(
+                        f"[minio][warn] clear lifecycle failed: "
+                        f"delete_error={e_delete} | remove_error={e_remove}"
+                    )
+                    return
+
+            print(f"[minio][warn] clear lifecycle failed: {e_delete}")
+
+
+    def _ensure_public_read(self) -> None:
+        """
+        为当前 bucket 设置只读的公共访问策略（允许匿名 GetObject）。
+        失败时仅告警，不中断流程。
+        """
+        client = self._client
+        bucket = self.bucket
+        if not client or not bucket:
+            return
+
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": ["*"]},
+                    "Action": ["s3:GetObject"],
+                    "Resource": [f"arn:aws:s3:::{bucket}/*"],
+                }
+            ],
+        }
+        try:
+            client.set_bucket_policy(bucket, json.dumps(policy))
+            print(f"[minio] bucket={bucket} policy=public-read applied")
+        except Exception as exc:
+            print(f"[minio][warn] set public-read policy failed: {exc}")
+
+
+    async def warmup_ring_ptr(self, safe_id: str, ring_size: int) -> None:
+        """
+        在服务重启后，根据 MinIO 现有对象恢复“最新槽位号”，使下一次写入从最新之后开始。
+        规则：
+          1) 优先从 Redis 读取已持久化的指针（如果存在且 < ring_size）
+          2) 否则列举 {safe_id}/ring/ 前缀下所有对象，按 last_modified 找到最新对象，
+             再从 object_key 中解析槽位号，设置为“当前指针”（下一次写入 +1）。
+        """
+        if ring_size <= 0:
+            return
+        # 1) 先看 Redis 是否有持久化指针
+        try:
+            persisted = r.hget("minio:ring_ptr", safe_id)
+            if persisted is not None:
+                pi = int(persisted)
+                if 0 <= pi < ring_size:
+                    self._ring_ptr[safe_id] = pi
+                    return
+        except Exception:
+            pass
+
+        # 2) 扫描 MinIO 对象，找到最新的那一个
+        if not self._client:
+            return
+
+        prefix = f"{safe_id}/ring/"
+        def _list_all():
+            # 列举所有对象；MinIO SDK 的 list_objects 是生成器
+            return list(self._client.list_objects(self.bucket, prefix=prefix, recursive=True))
+
+        items = await self._run_in_executor(self._io_executor, _list_all)
+        if not items:
+            self._ring_ptr[safe_id] = -1
+            return
+
+        # 找 last_modified 最新的对象
+        latest = max(items, key=lambda o: getattr(o, "last_modified", None) or 0)
+        key = latest.object_name
+        # 解析槽位号：.../ring/000123[_intrussion].jpg
+        m = re.search(r"/ring/(\d{6})", key)
+        if not m:
+            self._ring_ptr[safe_id] = -1
+            return
+        idx = int(m.group(1))
+        self._ring_ptr[safe_id] = idx
+        # 同步保存到 Redis，便于下次快速恢复
+        try:
+            r.hset("minio:ring_ptr", safe_id, idx)
+        except Exception:
+            pass
+
+    
+
+    
+    
+    async def ring_object_count(self, safe_id: str, at_least: Optional[int] = None) -> int:
+        """
+        统计 {safe_id}/ring/ 前缀下对象数量。
+        - at_least: 若设置，则在计数达到该阈值时就提前返回（早停），降低列举成本。
+        """
+        if not self._client:
+            return 0
+
+        prefix = f"{safe_id}/ring/"
+
+        def _count():
+            c = 0
+            for _ in self._client.list_objects(self.bucket, prefix=prefix, recursive=True):
+                c += 1
+                if at_least is not None and c >= at_least:
+                    return c
+            return c
+
+        return await self._run_in_executor(self._io_executor, _count)
+
+    
     async def put_bytes(
         self, obj_key: str, data: bytes, content_type: str = "image/jpeg"
     ) -> str | None:
@@ -304,13 +485,142 @@ class MinioManager:
 
         return await self._run_in_executor(self._upload_executor, _put)
 
+    
+
+    async def shrink_keep_last_n(self, safe_id: str, old_M: int, new_N: int) -> None:
+        """
+        将“缩环时刻最近的 new_N 帧”平移到 0..new_N-1（ring/000000..），删除其他对象，
+        并把指针设置为 new_N-1（下一帧从 0 覆盖写）。
+        需要：old_M >= new_N >= 0
+        """
+        if not self._client or new_N < 0 or old_M < 0 or new_N > old_M:
+            return
+
+        # N=0 => 清空并停写
+        if new_N == 0:
+            prefix = f"{safe_id}/ring/"
+            def _delete_all():
+                for o in self._client.list_objects(self.bucket, prefix=prefix, recursive=True):
+                    try:
+                        self._client.remove_object(self.bucket, o.object_name)
+                    except Exception as e:
+                        print(f"[minio][warn] remove {o.object_name} failed: {e}")
+            await self._run_in_executor(self._io_executor, _delete_all)
+            # 指针置 -1
+            self._ring_ptr[safe_id] = -1
+            try:
+                r.hset("minio:ring_ptr", safe_id, -1)
+            except Exception:
+                pass
+            return
+
+        # 取指针 P（上一帧写到的槽位）。没有就先 warmup
+        if safe_id not in self._ring_ptr:
+            await self.warmup_ring_ptr(safe_id, old_M)
+        P = int(self._ring_ptr.get(safe_id, -1))
+        if P < 0:  # 没有历史帧，直接结束：只需要把指针设为 -1 让下次从 0 开写
+            try:
+                r.hset("minio:ring_ptr", safe_id, -1)
+            except Exception:
+                pass
+            self._ring_ptr[safe_id] = -1
+            return
+
+        M = int(old_M)
+        N = int(new_N)
+
+        # 计算最近 N 帧的连续区间 S（从旧到新）
+        s = (P - (N - 1) + M) % M
+        e = P
+        if s <= e:
+            S_slots = list(range(s, e + 1))                # 不跨0
+        else:
+            S_slots = list(range(s, M)) + list(range(0, e + 1))  # 跨0
+
+        # 免复制特例：S 恰好是 0..N-1（即 P == N-1 且不跨0）
+        if s == 0 and e == N - 1:
+            # 仅删除 N..M-1
+            prefix = f"{safe_id}/ring/"
+            def _delete_high_tail():
+                for o in self._client.list_objects(self.bucket, prefix=prefix, recursive=True):
+                    # .../ring/000123*.jpg 解析槽位
+                    m = re.search(r"/ring/(\d+)", o.object_name)
+                    if not m: 
+                        continue
+                    idx = int(m.group(1))
+                    if idx >= N:
+                        try:
+                            self._client.remove_object(self.bucket, o.object_name)
+                        except Exception as ee:
+                            print(f"[minio][warn] remove {o.object_name} failed: {ee}")
+            await self._run_in_executor(self._io_executor, _delete_high_tail)
+
+            # 指针校正为 N-1（下一帧写 0）
+            self._ring_ptr[safe_id] = N - 1
+            try:
+                r.hset("minio:ring_ptr", safe_id, N - 1)
+            except Exception:
+                pass
+            return
+
+        # 一般情形：需要平移（server-side copy），然后清理
+        # 目标键集合：dst(i) = 0..N-1
+        dst_keys = [f"{safe_id}/ring/{i:06d}{'_intrussion' if MINIO_USE_INTRUSSION_SUFFIX else ''}.jpg" for i in range(N)]
+
+        def _copy_and_cleanup():
+            # 1) 平移：S[i] -> i
+            for i, slot in enumerate(S_slots):
+                src_key = f"{safe_id}/ring/{slot:06d}{'_intrussion' if MINIO_USE_INTRUSSION_SUFFIX else ''}.jpg"
+                dst_key = dst_keys[i]
+                if src_key == dst_key:
+                    continue
+                try:
+                    if CopySource is None:
+                        # SDK 极老版本兜底：下载再上传（不建议，但保证可用）
+                        data = self._client.get_object(self.bucket, src_key).read()
+                        bio = io.BytesIO(data)
+                        self._client.put_object(self.bucket, dst_key, bio, len(data), content_type="image/jpeg")
+                    else:
+                        self._client.copy_object(self.bucket, dst_key, CopySource(self.bucket, src_key))
+                except Exception as ee:
+                    print(f"[minio][warn] copy {src_key} -> {dst_key} failed: {ee}")
+
+            # 2) 删除除 dst(0..N-1) 之外的所有对象
+            keep = set(dst_keys)
+            prefix = f"{safe_id}/ring/"
+            for o in self._client.list_objects(self.bucket, prefix=prefix, recursive=True):
+                if o.object_name not in keep:
+                    try:
+                        self._client.remove_object(self.bucket, o.object_name)
+                    except Exception as ee:
+                        print(f"[minio][warn] remove {o.object_name} failed: {ee}")
+
+        # 与 next_ring_slot 的自增串行化，降低竞态
+        async with self._ring_lock:
+            await self._run_in_executor(self._io_executor, _copy_and_cleanup)
+            # 3) 指针设为 N-1（下一帧写 0）
+            self._ring_ptr[safe_id] = N - 1
+            try:
+                r.hset("minio:ring_ptr", safe_id, N - 1)
+            except Exception:
+                pass
+
     async def next_ring_slot(self, safe_id: str, ring_size: int) -> Optional[int]:
         if ring_size <= 0:
             return None
         async with self._ring_lock:
+            # 如果当前没有指针，尝试 Redis/MinIO 恢复
+            if safe_id not in self._ring_ptr:
+                await self.warmup_ring_ptr(safe_id, ring_size)
+
             current = self._ring_ptr.get(safe_id, -1)
             next_index = (current + 1) % ring_size
             self._ring_ptr[safe_id] = next_index
+            # 持久化到 Redis
+            try:
+                r.hset("minio:ring_ptr", safe_id, next_index)
+            except Exception:
+                pass
             return next_index
 
     async def _run_in_executor(
@@ -373,6 +683,29 @@ def _to_builtin(o):
     if isinstance(o, (np.ndarray,)):
         return o.tolist()
     return o
+
+def annotate_image_with_results(image: bytes, analysis: dict) -> bytes:
+    # Decode the image
+    nparr = np.frombuffer(image, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return image
+
+    # Example: Adding a simple annotation on the image
+    text = analysis.get("state", "Unknown")
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1
+    color = (0, 255, 0)  # Green color for the text
+    thickness = 2
+    position = (50, 50)  # Position for the text
+
+    # Overlay text on the image
+    cv2.putText(img, text, position, font, font_scale, color, thickness)
+
+    # Re-encode the image back to JPEG format
+    _, jpeg_img = cv2.imencode('.jpg', img)
+    return jpeg_img.tobytes()
 
 # ★★★ 替换原函数签名和所有 return ★★★
 def _decode_and_analyze_frame(
@@ -498,7 +831,7 @@ async def get_one_frame(stream_name: str, timeout_sec: float = 1.0):
     return None, None
 
 
-async def stream_worker(stream_name: str):
+async def stream_worker(stream_name: str, annotate_images: bool):
     print(f"[worker start] {stream_name}")
 
     video_writer = None
@@ -511,16 +844,34 @@ async def stream_worker(stream_name: str):
             if jpeg is None:
                 continue
 
+            safe_id = safe_filename(stream_name)  # ← 新增：后面上传或裁剪都会用到
             ts3_epoch = time.time()
             ts3_iso = now_iso_utc()
 
-            # ========== 调用分析（仅在 CPU 线程里解码一次）==========
+            # ========== 冷静期判断 & 调用分析 ==========
             prev_frame = PREV_FRAMES.get(stream_name)
             t_proc_start = time.monotonic()
-            analysis, curr_grey = await analyze_frame_async(jpeg, prev_frame)
+
+            cooldown_s = get_cooldown_seconds(stream_name)
+            now_epoch = time.time()
+            in_cooldown = False
+            if cooldown_s > 0:
+                last_intr = LAST_INTRUSION_TS.get(stream_name, 0.0)
+                if last_intr > 0 and (now_epoch - last_intr) < cooldown_s:
+                    in_cooldown = True
+
+            if in_cooldown:
+                # 冷静期：跳过耗时的算法检测与解码；直接视为“正常”，并标记 in_cooldown
+                analysis = build_state_payload(StreamState.NORMAL, decode_ms=None, in_cooldown=True,
+                                              cooldown_left=round(cooldown_s - (now_epoch - last_intr), 2))
+                curr_grey = None
+            else:
+                analysis, curr_grey = await analyze_frame_async(jpeg, prev_frame)
+
             t_proc_end = time.monotonic()
             if curr_grey is not None:
                 PREV_FRAMES[stream_name] = curr_grey
+
 
             # ========== 计算时延 ==========
             ts1_epoch = parse_iso_to_epoch(meta.get("ts1"))
@@ -552,23 +903,35 @@ async def stream_worker(stream_name: str):
 
             # ========== 异常判定 ==========
             is_abnormal = analysis.get("state") not in ("Normal", None)
+            if is_abnormal:
+                LAST_INTRUSION_TS[stream_name] = time.time()
 
-            # ========== MinIO: 仍然写“原始 JPEG”，不做叠加/再编码 ==========
+            # 这里的 annotate_images 决定是否需要对图像进行标注
+            if annotate_images:
+                jpeg = annotate_image_with_results(jpeg, analysis)
+
+            # ========== 保存到 MinIO 逻辑 ==========
+            # 这里继续上传 JPEG（原始图像或已标注图像）
             raw_jpeg = jpeg
 
             # 保存策略：若你只想异常时写 -> 环境变量设 MINIO_SAVE_MODE=abnormal
             save_this = (MINIO_SAVE_MODE == "all") or (MINIO_SAVE_MODE == "abnormal" and is_abnormal)
             _minio_pending_refs: List[dict] = []
             upload_durations: List[float] = []
+            saved_obj_key = None  # 用于 WS 返回
+            # 只在不处于缩环迁移时才写 MinIO
             if (
                 save_this
                 and MINIO_MANAGER.is_ready
-                and MINIO_MAX_FRAMES_PER_STREAM > 0
+                and get_max_frames(stream_name) > 0
+                and safe_id not in MINIO_MIGRATING
             ):
                 safe_id = safe_filename(stream_name)
                 primary_reason = "abnormal" if is_abnormal else "all"
+
+                # 按每路上限获取槽位（内部会自动从 Redis/MinIO 恢复指针）
                 slot_index = await MINIO_MANAGER.next_ring_slot(
-                    safe_id, MINIO_MAX_FRAMES_PER_STREAM
+                    safe_id, get_max_frames(stream_name)
                 )
                 if slot_index is not None:
                     ring_key = build_ring_obj_key(safe_id, slot_index)
@@ -588,17 +951,27 @@ async def stream_worker(stream_name: str):
                                 "reason": primary_reason,
                             }
                         )
+                        saved_obj_key = ring_key
 
-                if MONITORING_ENABLED and upload_durations:
-                    PERFORMANCE_MONITOR.record_stage(
-                        stream_name, "minio_upload", sum(upload_durations)
-                    )
+            # === 与保存解耦：即使这帧没上传，也要按需裁剪一次 ===
+            if stream_name in STREAMS_NEED_TRIM:
+                try:
+                    
+                    await MINIO_MANAGER.enforce_quota(safe_id, get_max_frames(stream_name))
+                finally:
+                    STREAMS_NEED_TRIM.discard(stream_name)
+
+            if MONITORING_ENABLED and upload_durations:
+                PERFORMANCE_MONITOR.record_stage(
+                    stream_name, "minio_upload", sum(upload_durations)
+                )
 
             # ========== 组织 WS payload（仍包含分析结果）==========
             payload = {
                 "stream": str(stream_name),
                 "ts_wall": meta.get("ts_wall_iso"),
                 "shape": meta.get("shape"),
+                #"minio_bucket": MINIO_BUCKET,   # ★ 新增：WS 中返回 bucket 信息
                 "result": analysis,  # 这里就是你的分析结果
                 "timing": {
                     "ts1": meta.get("ts1"),
@@ -612,11 +985,11 @@ async def stream_worker(stream_name: str):
                         "analysis": round(analysis_ms, 3),
                         "proc": round(proc_ms, 3),
                         "end2end": None if e2e_ms is None else round(e2e_ms, 3),
-                    }
-                }
+                    },
+                    "image_minio": f"http://{config_settings.minio.endpoint}/{MINIO_BUCKET}/{saved_obj_key}" if saved_obj_key else None
+                },
             }
-            if _minio_pending_refs:
-                payload.setdefault("obj_refs", []).extend(_minio_pending_refs)
+
 
             # WS 发送开关：all / abnormal
             if WS_SEND_MODE == "abnormal" and not is_abnormal:
@@ -703,15 +1076,7 @@ async def broadcaster():
             print(f"[broadcast] sent {ticks} msgs, active_ws={len(WS_CLIENTS)}")
 
 
-@router.post("/start")
-async def start_service():
-    global SERVICE_ACTIVE
-    if SERVICE_ACTIVE:
-        print("[service] start called, but already active")
-        return {"ok": True, **localized_message_payload("service.already_started")}
-    SERVICE_ACTIVE = True
-    print("[service] started")
-    return {"ok": True, **localized_message_payload("service.started")}
+
 
 
 @router.post("/stop")
@@ -735,11 +1100,22 @@ async def stop_service():
 
 @router.post("/subscribe")
 async def subscribe(body: Dict = Body(...)):
-    global CURRENT_THRESHOLD, EDGE_PARAMS, TAMPER_PARAMS
+    global SERVICE_ACTIVE, CURRENT_THRESHOLD, EDGE_PARAMS, TAMPER_PARAMS, SERVICE_RESTARTED
 
+    # 检查是否包含 `minio_storage_per_stream`，如果没有则返回 400 错误
+    if "minio_storage_per_stream" not in body:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="minio_storage_per_stream is required"
+        )
+
+    # Check for the 'annotate_images' flag and default it to False if not provided
+    annotate_images = body.get("annotate_images", False)
+
+    # ★ 不再拒绝：若未激活，则在订阅时自动启动
     if not SERVICE_ACTIVE:
-        print("[subscribe] rejected, service not started")
-        return make_error_response("error.service_not_started", status_code=400)
+        SERVICE_ACTIVE = True
+        print("[service] auto-start by subscribe")
 
     streams = body.get("streams", [])
     if not isinstance(streams, list):
@@ -758,10 +1134,80 @@ async def subscribe(body: Dict = Body(...)):
     for name in SUBSCRIBED_STREAMS:
         if name not in STREAM_WORKERS:
             print(f"[subscribe] creating worker for {name}")
-            STREAM_WORKERS[name] = asyncio.create_task(stream_worker(name))
+            STREAM_WORKERS[name] = asyncio.create_task(stream_worker(name, annotate_images))
+
+    # === 新增：解析 per-stream 上限与冷静期 ===
+    raw_limit = body.get("minio_storage_per_stream", 100000)
+    raw_cooldown = body.get("intrusion_cooldown_seconds", None)
+
+    # 允许两种形式：
+    #  1) 整数：对所有订阅流生效
+    #  2) dict：{stream_name: int}
+    def _as_int(v, default=None):
+        try:
+            return int(v)
+        except Exception:
+            return default
+
+    # 记录哪些流上限变小了，用于触发一次性裁剪
+    decreased_streams: List[str] = []
+
+    for name in SUBSCRIBED_STREAMS:
+        # --- 上限 ---
+        if SERVICE_RESTARTED:
+            # 如果服务重启，则根据当前MinIO容量来设置 prev
+            prev = await get_current_minio_capacity(safe_filename(name))
+        else:
+            # 服务未重启时，使用上一次POST请求的最大帧数
+            prev = get_max_frames(name)
+        if isinstance(raw_limit, dict):
+            new_limit = _as_int(raw_limit.get(name), prev)
+        elif raw_limit is not None:
+            new_limit = _as_int(raw_limit, prev)
+        else:
+            new_limit = prev  # 未提供则保持
+
+        PER_STREAM_MAX_FRAMES[name] = new_limit
+
+        if MINIO_MANAGER.is_ready and new_limit > 0:
+            safe_id = safe_filename(name)
+            try:
+                # 只有当 new_limit < prev 时才需要缩环迁移
+                if new_limit < prev:
+                    print(f"[subscribe] shrink {name}: M={prev} -> N={new_limit}")
+                    async def _do_shrink(safe_id,prev,new_limit):
+                        MINIO_MIGRATING.add(safe_id)
+                        try:
+                            await MINIO_MANAGER.shrink_keep_last_n(safe_id, old_M=prev, new_N=new_limit)
+                        finally:
+                            MINIO_MIGRATING.discard(safe_id)
+                    asyncio.create_task(_do_shrink(safe_id,prev,new_limit))
+                    
+                else:
+                    # 扩容或不变：无需处理。可按需清理高槽位历史重复（通常不需要）
+                    pass
+            except Exception as e:
+                print(f"[subscribe][warn] shrink_keep_last_n failed for {name}: {e}")
+
+        
+            
+
+        # --- 冷静期 ---
+        if isinstance(raw_cooldown, dict):
+            PER_STREAM_COOLDOWN[name] = _as_int(raw_cooldown.get(name), get_cooldown_seconds(name)) or 0
+        elif raw_cooldown is not None:
+            PER_STREAM_COOLDOWN[name] = _as_int(raw_cooldown, get_cooldown_seconds(name)) or 0
+        else:
+            # 未提供不变；首次订阅无值则为 0
+            PER_STREAM_COOLDOWN.setdefault(name, 0)
+
+    if decreased_streams:
+        print(f"[subscribe] decreased limits for: {decreased_streams} -> will trim oldest objects once")
 
     print(f"[subscribe] epoch={curr_epoch}, subscribed={list(SUBSCRIBED_STREAMS)}")
     print(f"[params] current_threshold={CURRENT_THRESHOLD}, edge_params={EDGE_PARAMS}, tamper_params={TAMPER_PARAMS}")
+
+    SERVICE_RESTARTED = False
     return {"ok": True, "epoch": curr_epoch, "subscribed": list(SUBSCRIBED_STREAMS)}
 
 
@@ -786,6 +1232,8 @@ async def ws_results(websocket: WebSocket):
 async def on_start():
     asyncio.create_task(broadcaster())
     MINIO_MANAGER.initialize()
+
+
 
 
 # 挂载 router
