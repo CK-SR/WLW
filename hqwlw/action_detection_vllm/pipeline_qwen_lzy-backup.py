@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 import time
-from pathlib import Path
+from pathlib import Pathtimeout_sec: float = 1.0
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from collections import defaultdict, deque
 import asyncio
@@ -181,31 +181,6 @@ def _draw_one_detection(frame_bgr: np.ndarray, bbox_xyxy: Tuple[int,int,int,int]
     x1,y1,x2,y2 = bbox_xyxy
     cv2.rectangle(img, (x1,y1), (x2,y2), (0,255,0), 2)
     cv2.putText(img, label, (x1, max(0, y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-    return img
-
-
-def _draw_person_boxes_red(
-    frame_bgr: np.ndarray,
-    bboxes_xyxy: List[Tuple[int, int, int, int]],
-) -> np.ndarray:
-    """在原始帧上绘制红色人物框。"""
-    img = frame_bgr.copy()
-    for x1, y1, x2, y2 in bboxes_xyxy:
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-    return img
-
-
-def _draw_result_top_left(frame_bgr: np.ndarray, label: str) -> np.ndarray:
-    """将识别结果绘制在左上角，保证可读性。"""
-    img = frame_bgr.copy()
-    text = label.strip() or "unknown"
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = 0.8
-    thickness = 2
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-    x, y = 12, 30
-    cv2.rectangle(img, (x - 6, y - th - 8), (x + tw + 6, y + baseline + 8), (0, 0, 0), -1)
-    cv2.putText(img, text, (x, y), font, scale, (0, 255, 255), thickness)
     return img
 
 
@@ -1086,10 +1061,8 @@ class QwenPersonActionPipeline:
             except Exception:
                 pass
 
-            frame_for_vllm = task.get("frame_for_vllm")
-            if frame_for_vllm is None:
-                frame_for_vllm = task["crop"]
-            qwen_action = self._classify_action_with_qwen(frame_for_vllm)
+            crop = task["crop"]
+            qwen_action = self._classify_action_with_qwen(crop)
 
             cls_id = qwen_action.class_id
             cls_name_norm = (qwen_action.class_name or "").strip().lower()
@@ -1171,11 +1144,8 @@ class QwenPersonActionPipeline:
             bbox = task["bbox_xyxy"]
 
             label = f'{qwen_action.class_name or "unknown"} {qwen_action.confidence or 0:.2f}'
-            frame_with_boxes = task.get("frame_for_vllm")
-            if frame_with_boxes is None:
-                frame_with_boxes = _draw_person_boxes_red(raw_frame, [bbox])
             if upload_annotated:
-                upload_img = _draw_result_top_left(frame_with_boxes, label)
+                upload_img = _draw_one_detection(raw_frame, bbox, label)
                 obj_key = _upload_frame_to_minio(task["safe_id"], task["frame_index"], task["msg_id"], upload_img, annotated=True)
             else:
                 obj_key = _upload_frame_to_minio(task["safe_id"], task["frame_index"], task["msg_id"], raw_frame, annotated=False)
@@ -1336,18 +1306,14 @@ class QwenPersonActionPipeline:
                 if not detections:
                     continue
 
-                person_boxes: List[Tuple[int, int, int, int]] = []
-                for detection in detections:
+                
+
+                for person_id, detection in enumerate(detections):
                     x1, y1, x2, y2 = _expand_box(
                         detection.box_xyxy, t["box_expand_ratio"], img_width, img_height
                     )
-                    person_boxes.append((x1, y1, x2, y2))
-
-                frame_with_boxes = _draw_person_boxes_red(frame, person_boxes)
-                frame_for_vllm, _, _ = _ensure_min_short_side(frame_with_boxes, t["crop_min_short_side"])
-
-                for person_id, detection in enumerate(detections):
-                    x1, y1, x2, y2 = person_boxes[person_id]
+                    crop = frame[y1:y2, x1:x2].copy()
+                    crop, _, _ = _ensure_min_short_side(crop, t["crop_min_short_side"])
 
                     bbox_xyxy_norm = [
                         x1 / img_width,
@@ -1363,11 +1329,10 @@ class QwenPersonActionPipeline:
                         "frame_index": frame_idx,
                         "person_index": person_id,
                         "raw_frame": frame,
-                        "frame_for_vllm": frame_for_vllm,
                         "bbox_xyxy": (x1, y1, x2, y2),
                         "bbox_xyxy_norm": bbox_xyxy_norm,
                         "grounding_score": float(detection.score),
-                        "crop": frame_for_vllm,
+                        "crop": crop,
                         "msg_id": t["msg_id"],
                         "meta": meta or {},
                         #"raw_frame_obj_key": raw_frame_obj_key,
@@ -1461,9 +1426,9 @@ class QwenPersonActionPipeline:
 
         user_text = (self._user_prompt or "").strip()
         if user_text:
-            user_text = user_text + "\n\nAnalyze this annotated source frame and output JSON only."
+            user_text = user_text + "\n\nAnalyze this single person crop and output JSON only."
         else:
-            user_text = "Analyze this annotated source frame and output JSON only."
+            user_text = "Analyze this single person crop and output JSON only."
 
         messages: List[Dict[str, Any]] = []
         if system_text:
@@ -1603,7 +1568,7 @@ class QwenPersonActionPipeline:
         h, w = crop.shape[:2]
         meta = {
             "jpeg_bytes": jpeg_bytes,
-            "frame_wh": (w, h),
+            "crop_wh": (w, h),
         }
         if http_error:
             meta["http_error_msg"] = http_error
